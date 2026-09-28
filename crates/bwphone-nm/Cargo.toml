@@ -1,0 +1,25 @@
+[package]
+name = "bwphone-nm"
+description = "The Bitwarden extension's native-messaging protocol: framing, EncString type 2, the setupEncryption handshake and the biometrics commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes = "0.8"
+base64 = "0.22"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+hmac = "0.12"
+rand = "0.8"
+rsa = { version = "0.9", features = ["sha1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util"] }
+zeroize = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

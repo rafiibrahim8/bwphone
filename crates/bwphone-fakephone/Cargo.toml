@@ -1,0 +1,13 @@
+[package]
+name = "bwphone-fakephone"
+description = "A phone with no Android in it: the same transport crate, RSA keys in memory, no fingerprint, but every phone-side rule enforced"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bwphone-transport = { path = "../bwphone-transport" }
+bwphone-wrap = { path = "../bwphone-wrap" }
+rand = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

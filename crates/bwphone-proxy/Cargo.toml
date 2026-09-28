@@ -1,0 +1,10 @@
+[package]
+name = "bwphone-proxy"
+description = "What the browser's manifest points at: relays its stdio to the daemon's socket, byte for byte, and never sees a key"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "io-util", "io-std", "net", "fs", "macros"] }

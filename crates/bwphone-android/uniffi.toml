@@ -1,0 +1,5 @@
+# Read by uniffi-bindgen (gen-kotlin.sh) when generating the Kotlin binding.
+[bindings.kotlin]
+# Android-aware output: the binding uses android.system.SystemCleaner from
+# API 34 and JNA's cleaner below that (minSdk is 28).
+android = true

@@ -1,0 +1,16 @@
+[package]
+name = "bwphone-wrap"
+description = "vault.blob v4: RSA-OAEP (SHA-256, MGF1-SHA1) wrapped K_wrap + AES-256-GCM over the user key"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes-gcm = "0.10"
+rand = "0.8"
+rsa = { version = "0.9", features = ["sha1", "sha2"] }
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+zeroize = "1"

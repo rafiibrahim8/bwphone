@@ -1,0 +1,15 @@
+[package]
+name = "bwphone-hello"
+description = "Receives the phone's encrypted address announcements and answers its rotating mDNS name; holds only the hello key"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deliberately tiny: no wallet, no D-Bus, no JSON, no blob or native-messaging
+# code can be linked from here. It gets its one key from the daemon over a
+# Unix socket in plain text, and runs sandboxed with no session bus and no home.
+[dependencies]
+bwphone-transport = { path = "../bwphone-transport", default-features = false }
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+zeroize = "1"

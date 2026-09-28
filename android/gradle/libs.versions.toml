@@ -1,0 +1,42 @@
+[versions]
+# Android 9 and up, Android 16 behaviour. compileSdk 37.2 for Material 3
+# Expressive (material3 1.5, Compose 1.13).
+minSdk = "28"
+targetSdk = "36"
+compileSdk = "37"
+compileSdkMinor = "2"
+agp = "9.4.1"
+kotlin = "2.4.20"
+# Alpha BOM: Material 3 Expressive (MaterialShapes, wavy progress) ships only in material3 1.5.
+compose-bom = "2026.09.01"
+graphics-shapes = "1.1.0"
+activity-compose = "1.13.0"
+lifecycle = "2.10.0"
+core-ktx = "1.19.1"
+appcompat = "1.7.1"
+biometric = "1.1.0"
+coroutines = "1.10.2"
+jna = "5.14.0"
+zxing-embedded = "4.3.0"
+
+[libraries]
+compose-bom = { group = "androidx.compose", name = "compose-bom-alpha", version.ref = "compose-bom" }
+compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+compose-ui = { group = "androidx.compose.ui", name = "ui" }
+compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+compose-material-icons = { group = "androidx.compose.material", name = "material-icons-extended" }
+graphics-shapes = { group = "androidx.graphics", name = "graphics-shapes", version.ref = "graphics-shapes" }
+activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activity-compose" }
+lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycle" }
+lifecycle-process = { group = "androidx.lifecycle", name = "lifecycle-process", version.ref = "lifecycle" }
+core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "core-ktx" }
+appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
+coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
+zxing-embedded = { group = "com.journeyapps", name = "zxing-android-embedded", version.ref = "zxing-embedded" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

@@ -1,0 +1,13 @@
+[package]
+name = "bwphone-bindgen"
+description = "Build-time tool: generates the Kotlin side of the uniffi binding. Kept out of bwphone-android so the phone's .so never compiles the generator's dependencies (askama, goblin, weedle2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { version = "0.29", features = ["cli"] }

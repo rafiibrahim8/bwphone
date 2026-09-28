@@ -1,0 +1,7 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+# Built by cargo-ndk; see README.md.
+app/src/main/jniLibs/

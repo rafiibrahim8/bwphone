@@ -1,0 +1,20 @@
+[package]
+name = "bwphone-android"
+description = "The phone's view of bwphone-transport, exposed to Kotlin through uniffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "bwphone_android"
+
+# Runtime only. The Kotlin generator lives in `bwphone-bindgen`, so nothing
+# of it is compiled into the .so that ships on the phone.
+[dependencies]
+bwphone-transport = { path = "../bwphone-transport", default-features = false }
+rand = "0.8"
+serde_json = "1"
+thiserror = "2"
+uniffi = "0.29"
+zeroize = "1"

@@ -1,0 +1,55 @@
+[Unit]
+Description=bwphone hello receiver and mDNS responder
+After=graphical-session.target bwphone.service
+PartOf=graphical-session.target
+# Stopping or restarting the daemon does the same to this unit, so its view of
+# the daemon's socket directory is always a fresh one.
+PartOf=bwphone.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/bwphone/bwphone-hello
+Restart=on-failure
+RestartSec=2
+
+# This process listens to the network, so it gets the least of everything.
+# It holds only hello_key, which the daemon hands it over
+# $XDG_RUNTIME_DIR/bwphone-hello/hello.sock: that socket is the only thing
+# it can reach. Compromised, it can misdirect the daemon to a wrong phone
+# address; it cannot read the wallet, a blob, or the daemon's other sockets.
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+# No session bus: no wallet, no notifications.
+InaccessiblePaths=-%t/bus
+# ProtectHome=tmpfs empties /home, /root AND /run/user. So: no home at all,
+# and of the runtime directory only the daemon's hello socket is bound back
+# in; the daemon's other sockets (%t/bwphone) and the session bus stay hidden.
+# The binary itself needs binding when it lives under ~/.local (the installer
+# rewrites that path for /usr installs, where the bind is a no-op).
+ProtectHome=tmpfs
+BindPaths=%t/bwphone-hello
+BindReadOnlyPaths=-%h/.local/lib/bwphone/bwphone-hello
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=graphical-session.target

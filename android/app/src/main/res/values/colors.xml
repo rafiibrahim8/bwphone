@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The window behind Compose, so a cold start doesn't flash the wrong colour. -->
+    <color name="window_background">#FFF4FAFA</color>
+    <color name="ic_launcher_background">#FFB1ECF1</color>
+    <color name="ic_launcher_glyph">#FF2A6A6F</color>
+</resources>

@@ -1,0 +1,48 @@
+[Unit]
+Description=bwphone daemon: phone-gated Bitwarden unlock
+After=graphical-session.target
+PartOf=graphical-session.target
+# Starting the daemon starts the hello receiver too; bwphone-hello is PartOf
+# this unit, so stopping or restarting it does the same to the receiver.
+Wants=bwphone-hello.service
+
+[Service]
+Type=simple
+# ReadWritePaths= below only applies to directories that already exist, and
+# the sandbox can't create them. `+` runs this mkdir outside the sandbox
+# (still as the user), so a system-wide install works on each user's first start.
+ExecStartPre=+mkdir -p %h/.local/share/bwphone %h/.local/state/bwphone
+ExecStart=%h/.local/bin/bwphone daemon
+Restart=on-failure
+RestartSec=2
+
+# systemd-coredump would write a crash dump holding the key to disk.
+LimitCORE=0
+
+# The daemon needs the session bus (ksecretd, notifications), its runtime
+# directory, and its data/state directories; nothing else is writable.
+ProtectSystem=strict
+ProtectHome=read-only
+# `-`: a path that does not exist yet (first start) must not fail the namespace.
+ReadWritePaths=-%h/.local/share/bwphone -%h/.local/state/bwphone %t/bwphone %t/bwphone-hello
+PrivateTmp=yes
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RuntimeDirectory=bwphone bwphone-hello
+RuntimeDirectoryMode=0700
+# Keep them across a restart of this unit: bwphone-hello bind-mounts
+# %t/bwphone-hello when it starts, and a directory deleted and recreated
+# under it would leave it holding a dead, empty copy (the daemon replaces the
+# socket file itself when it binds).
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=graphical-session.target

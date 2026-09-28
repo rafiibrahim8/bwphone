@@ -1,0 +1,17 @@
+# cargo-audit configuration. Every ignore needs a reason and a re-check date.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071, "Marvin attack": timing side channel in the `rsa`
+    # crate's PRIVATE-key operations (decryption / signing), no fix available.
+    #
+    # Not reachable here. In production the PC uses `rsa` only for
+    # public-key encryption (wrapping K_wrap to the phone's key; encrypting
+    # the extension's session key), which the advisory does not cover. Every
+    # RSA private-key operation in the design happens inside the phone's
+    # Keystore/TEE, never in this code. The only `rsa` decrypts in the
+    # workspace are in `bwphone-fakephone` and unit tests.
+    #
+    # Re-check when `rsa` 0.10 ships its constant-time rewrite; then drop this.
+    "RUSTSEC-2023-0071",
+]

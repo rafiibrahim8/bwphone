@@ -1,0 +1,171 @@
+# Push a tag like v0.1.0 and this builds everything and attaches it to a
+# GitHub Release:
+#   bwphone-<tag>-linux-x86_64.tar.gz   daemon, proxy, hello, units, installer
+#   bwphone-<tag>.apk                    the phone app, arm64-v8a, release-signed
+#   SHA256SUMS
+#
+# APK signing: set the repository secrets ANDROID_KEYSTORE_B64 (a PKCS#12
+# keystore, base64), ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and
+# ANDROID_KEY_PASSWORD to sign every release with the same key, so the phone
+# accepts updates in place. Without them a throwaway key is generated per
+# release and the app must be uninstalled before a newer build installs.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  NDK_VERSION: r26d
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  linux:
+    name: Linux binaries
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build
+        run: cargo build --release --locked -p bwphone -p bwphone-proxy -p bwphone-hello
+      - name: Package
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          dir="bwphone-${tag}-linux-x86_64"
+          mkdir -p "$dir/systemd"
+          for b in bwphone bwphone-proxy bwphone-hello; do
+            strip "target/release/$b"
+            install -m 0755 "target/release/$b" "$dir/$b"
+          done
+          install -m 0644 dist/systemd/*.service "$dir/systemd/"
+          install -m 0755 dist/install-prebuilt.sh "$dir/install.sh"
+          install -m 0644 LICENSE "$dir/"
+          install -m 0644 README.md "$dir/README.md"
+          # Pre-generated for people who do not run install.sh (which regenerates them).
+          mkdir -p "$dir/man" "$dir/completions"
+          "$dir/bwphone" manpages "$dir/man"
+          "$dir/bwphone" completions bash > "$dir/completions/bwphone.bash"
+          "$dir/bwphone" completions zsh  > "$dir/completions/_bwphone"
+          "$dir/bwphone" completions fish > "$dir/completions/bwphone.fish"
+          tar czf "$dir.tar.gz" "$dir"
+          echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  android:
+    name: Android app
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked --version 4.1.2
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: "platforms;android-37.2 build-tools;37.0.0"
+      - uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+        with:
+          gradle-version: "9.8.0"
+
+      - name: Native library (arm64-v8a)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release --locked -p bwphone-android
+
+      - name: Kotlin binding, regenerated from this build
+        run: |
+          set -eu
+          ./crates/bwphone-android/gen-kotlin.sh
+          cp crates/bwphone-android/out/kotlin/uniffi/bwphone_android/bwphone_android.kt \
+             android/app/src/main/java/uniffi/bwphone_android/bwphone_android.kt
+
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -eu
+          ks="$RUNNER_TEMP/release.keystore"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$ks"
+            echo "Signing with the repository's release key."
+          else
+            echo "::warning::No ANDROID_KEYSTORE_B64 secret: signing with a throwaway key. Uninstall the app before installing a newer build."
+            KEYSTORE_PASSWORD="throwaway"; KEY_ALIAS="bwphone"; KEY_PASSWORD="throwaway"
+            keytool -genkeypair -v -keystore "$ks" -storetype PKCS12 -storepass "$KEYSTORE_PASSWORD" \
+              -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" -keyalg RSA -keysize 2048 -validity 3650 \
+              -dname "CN=bwphone throwaway, O=bwphone"
+          fi
+          {
+            echo "BWPHONE_KEYSTORE=$ks"
+            echo "BWPHONE_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "BWPHONE_KEY_ALIAS=$KEY_ALIAS"
+            echo "BWPHONE_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: Build APK
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          gradle -p android --no-daemon assembleRelease \
+            -PversionName="${tag#v}" -PversionCode="${GITHUB_RUN_NUMBER}"
+          cp android/app/build/outputs/apk/release/app-release.apk "bwphone-${tag}.apk"
+          echo "ASSET=bwphone-${tag}.apk" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [linux, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums
+        run: cd assets && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: assets/*
+          generate_release_notes: true

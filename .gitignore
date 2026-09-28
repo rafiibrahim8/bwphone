@@ -1,0 +1,3 @@
+/target
+crates/bwphone-android/out/
+.ignore/
