@@ -17,6 +17,7 @@ import me.ibrahimrafi.bwphone.ui.HomeActions
 import me.ibrahimrafi.bwphone.ui.HomeData
 import me.ibrahimrafi.bwphone.ui.HomeScreen
 import me.ibrahimrafi.bwphone.ui.PairScreen
+import me.ibrahimrafi.bwphone.ui.SettingsScreen
 import me.ibrahimrafi.bwphone.ui.UnlockScreen
 
 /**
@@ -24,7 +25,7 @@ import me.ibrahimrafi.bwphone.ui.UnlockScreen
  *
  *     adb shell am start -n me.ibrahimrafi.bwphone/.GalleryActivity --es screen unlock --ez dark true
  *
- * screen: home, home-new, unlock, unlock-warn, pair, pair-wait, enrol, enrol-compare, enrol-test, enrol-done, revoke
+ * screen: home, home-new, unlock, unlock-warn, pair, pair-wait, enrol, enrol-compare, enrol-test, enrol-done, revoke, settings
  */
 class GalleryActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -58,7 +59,7 @@ class GalleryActivity : ComponentActivity() {
             override fun enrol() {}
             override fun fixBattery() {}
             override fun fixNotifications() {}
-            override fun notificationSettings() {}
+            override fun settings() {}
             override fun revoke(accountHex: String) {}
             override fun revokeAll() {}
         }
@@ -96,6 +97,7 @@ class GalleryActivity : ComponentActivity() {
                         "enrol-compare" -> EnrolScreen(EnrolState.Phase.Compare("Family", fp), now + 152_000, {}, {}, {}, {})
                         "enrol-test" -> EnrolScreen(EnrolState.Phase.SelfTest("Family", fp), 0, {}, {}, {}, {})
                         "enrol-done" -> EnrolScreen(EnrolState.Phase.Done("Family"), 0, {}, {}, {}, {})
+                        "settings" -> SettingsScreen(25, 40, {}, {}, {}, {}, {})
                     }
                 }
             }

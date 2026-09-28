@@ -326,12 +326,19 @@ async fn a_busy_phone_is_an_alarm() {
 async fn control_socket_hello_status_and_dry_run() {
     let w = world(always(Decision::Approve)).await;
     let ip = "10.9.8.7".parse().unwrap();
-    let ok = control::handle(&w.ctx, ControlRequest::Hello { ip, port: 8731, seq: 5 }).await;
+    // An ephemeral port, as the phone announces when its own is taken.
+    let ok = control::handle(&w.ctx, ControlRequest::Hello { ip, port: 40123, seq: 5 }).await;
     assert_eq!(ok["ok"], true);
-    assert_eq!(w.ctx.state.lock().unwrap().addr, Some(SocketAddr::new(ip, 8731)));
+    assert_eq!(w.ctx.state.lock().unwrap().addr, Some(SocketAddr::new(ip, 40123)));
     let stale = control::handle(&w.ctx, ControlRequest::Hello { ip, port: 8731, seq: 5 }).await;
     assert_eq!(stale["ok"], false);
-    assert_eq!(w.ctx.pairing.lock().unwrap().as_ref().unwrap().last_hello_seq, 5);
+    {
+        let pairing = w.ctx.pairing.lock().unwrap();
+        let p = pairing.as_ref().unwrap();
+        assert_eq!(p.last_hello_seq, 5);
+        // What a restarted daemon or `bwphone enroll` will dial.
+        assert_eq!(p.last_phone_addr(), Some(SocketAddr::new(ip, 40123)));
+    }
 
     w.ctx.state.lock().unwrap().addr = Some(w.phone_addr);
     let status = control::handle(&w.ctx, ControlRequest::Status).await;
@@ -347,4 +354,81 @@ async fn control_socket_hello_status_and_dry_run() {
 
     let missing = control::handle(&w.ctx, ControlRequest::Unlock { label: "Nope".into() }).await;
     assert_eq!(missing["ok"], false);
+}
+
+/// A request whose asker is already gone when its turn comes never reaches
+/// the phone; the next real one still does.
+#[tokio::test]
+async fn an_unlock_nobody_waits_for_is_skipped() {
+    // Denials, so a wrongly-run dead request cannot hand its answer on and hide.
+    let w = world(always(Decision::Deny)).await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    drop(rx);
+    w.ctx.queue.push(unlock::Job { account_id: ACCOUNT, arrived: Instant::now(), reply: tx });
+
+    let unlocked = control::handle(&w.ctx, ControlRequest::Unlock { label: "Work".into() }).await;
+    assert_eq!(unlocked["reason"], "denied");
+    let prompts = w.phone.events().iter().filter(|e| matches!(e, Event::Prompted(_))).count();
+    assert_eq!(prompts, 1, "only the request someone waits for is shown: {:?}", w.phone.events());
+}
+
+/// The browser closes its pipe (its service worker idled out) while the
+/// prompt is up: the prompt comes down at once instead of waiting out the
+/// human phase for an answer nobody will read.
+#[tokio::test]
+async fn a_browser_that_leaves_takes_its_prompt_down() {
+    let w = world(always(Decision::Ignore)).await;
+    let mut browser = Browser::connect(w.ctx.clone(), "app-1").await;
+    browser.send("unlockWithBiometricsForUser", USER).await;
+    let notifier = w.notifier.clone();
+    wait_for("the prompt", || notifier.shown().len() == 1).await;
+
+    let left = Instant::now();
+    drop(browser);
+    wait_for("the prompt to close", || !notifier.shown()[0].2).await;
+    assert!(left.elapsed() < Duration::from_secs(2));
+    assert!(w.ctx.queue.is_empty());
+}
+
+/// Two browsers wait on one account and the first leaves: the prompt stays,
+/// and the second still gets the key from that one fingerprint.
+#[tokio::test]
+async fn a_second_browser_keeps_the_prompt_when_the_first_leaves() {
+    let w = world(after(Duration::from_millis(800), Decision::Approve)).await;
+    let mut a = Browser::connect(w.ctx.clone(), "app-a").await;
+    let mut b = Browser::connect(w.ctx.clone(), "app-b").await;
+    a.send("unlockWithBiometricsForUser", USER).await;
+    let notifier = w.notifier.clone();
+    wait_for("the prompt", || notifier.shown().len() == 1).await;
+    let id = b.send("unlockWithBiometricsForUser", USER).await;
+    let ctx = w.ctx.clone();
+    wait_for("the second request to queue", || ctx.queue.len() == 1).await;
+
+    drop(a);
+    let reply = b.read_reply().await;
+    assert_eq!(reply["messageId"], id);
+    assert_eq!(reply["response"], true);
+    assert_eq!(reply["userKeyB64"], b64(w.user_key.as_bytes()));
+    let prompts = w.phone.events().iter().filter(|e| matches!(e, Event::Prompted(_))).count();
+    assert_eq!(prompts, 1);
+}
+
+/// The phone refuses `rate_limited` before any prompt, so nothing shows
+/// there: the PC must say it, or the lockout is silent.
+#[tokio::test]
+async fn rate_limited_is_an_alarm() {
+    let w = world(always(Decision::Approve)).await;
+    w.phone.refuse_next_unwrap(bwphone_transport::msg::Status::RateLimited);
+    let mut browser = Browser::connect(w.ctx.clone(), "app-1").await;
+    let start = Instant::now();
+    assert_eq!(browser.call("unlockWithBiometricsForUser", USER).await["response"], false);
+    assert!(start.elapsed() < Duration::from_secs(2), "refused within the reach phase");
+    let warnings = w.notifier.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].0.contains("too many unlock requests"));
+    assert!(warnings[0].1.contains("someone else has been asking"));
+    assert!(w.notifier.shown().is_empty(), "no prompt, so no emoji");
+
+    // The next one goes through as usual.
+    assert_eq!(browser.call("unlockWithBiometricsForUser", USER).await["response"], true);
 }

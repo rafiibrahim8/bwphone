@@ -8,6 +8,11 @@ import android.util.Base64
  * and excluded from backup: the channel identity, what pairing derived, and
  * per-account state. Nothing Bitwarden-specific is ever stored: an account
  * is a random 16-byte id and the label the person chose.
+ *
+ * Sessions run on several threads at once, and each screen makes its own
+ * `Prefs`, so every read-modify-write here holds one process-wide lock:
+ * the write-once pin must not be set twice by two racing `set_pin`s, and
+ * account lists, counts, the hello `seq` and history must not lose updates.
  */
 class Prefs(context: Context) {
     private val prefs = SealedPrefs(context, "bwphone")
@@ -43,11 +48,30 @@ class Prefs(context: Context) {
         get() = prefs.getInt(K_LISTEN_PORT, 8731)
         set(v) = prefs.edit().putInt(K_LISTEN_PORT, v).apply()
 
+    /**
+     * The unlock limits per hour, from the Settings screen. Read clamped, so a
+     * value outside the range (or one that no longer opens) cannot switch the
+     * cap off; the overall cap is never below the per-account one.
+     */
+    val limitPerAccount: Int
+        get() = prefs.getInt(K_LIMIT_ACCOUNT, RateLimit.DEFAULT_PER_ACCOUNT).coerceIn(1, RateLimit.MAX_PER_ACCOUNT)
+
+    val limitOverall: Int
+        get() = prefs.getInt(K_LIMIT_OVERALL, RateLimit.DEFAULT_OVERALL).coerceIn(limitPerAccount, RateLimit.MAX_OVERALL)
+
+    fun setLimits(perAccount: Int, overall: Int) = synchronized(lock) {
+        val a = perAccount.coerceIn(1, RateLimit.MAX_PER_ACCOUNT)
+        prefs.edit()
+            .putInt(K_LIMIT_ACCOUNT, a)
+            .putInt(K_LIMIT_OVERALL, overall.coerceIn(a, RateLimit.MAX_OVERALL))
+            .apply()
+    }
+
     /** Monotonic; the PC ignores anything not higher than the last one it saw. */
-    fun nextHelloSeq(): Long {
+    fun nextHelloSeq(): Long = synchronized(lock) {
         val next = prefs.getLong(K_HELLO_SEQ, 0L) + 1
         prefs.edit().putLong(K_HELLO_SEQ, next).apply()
-        return next
+        next
     }
 
     /** Commit a pairing atomically; nothing is written on a cancelled one. */
@@ -81,15 +105,17 @@ class Prefs(context: Context) {
 
     fun hasAccount(id: String) = accountIds().contains(id)
 
-    fun addAccount(id: String, label: String) {
+    fun addAccount(id: String, label: String) = synchronized(lock) {
         prefs.edit()
             .putStringSet(K_ACCOUNTS, accountIds() + id)
             .putString("acc.$id.label", label)
             .apply()
     }
 
-    fun removeAccount(id: String) {
-        val e = prefs.edit().putStringSet(K_ACCOUNTS, accountIds() - id)
+    fun removeAccount(id: String) = synchronized(lock) {
+        val e = prefs.edit()
+            .putStringSet(K_ACCOUNTS, accountIds() - id)
+            .putStringSet(K_INVALIDATED, invalidated - id)
         for (k in prefs.keys()) if (k.startsWith("acc.$id.")) e.remove(k)
         e.remove("rate.$id").apply()
     }
@@ -99,26 +125,34 @@ class Prefs(context: Context) {
     /** `H(rsa_ct)`: the one ciphertext this account's key will decrypt. Write-once. */
     fun pin(id: String): ByteArray? = bytes("acc.$id.pin")
 
-    /** Returns false if a pin is already set: the PC cannot re-pin. */
-    fun setPinOnce(id: String, pin: ByteArray): Boolean {
+    /**
+     * Returns false if a pin is already set: the PC cannot re-pin. Check and
+     * write are one step under the lock, and the pin is on disk before the PC
+     * hears `ok`, so a crash cannot leave it pinned on one side only.
+     */
+    fun setPinOnce(id: String, pin: ByteArray): Boolean = synchronized(lock) {
         if (prefs.contains("acc.$id.pin")) return false
-        putBytes("acc.$id.pin", pin)
-        return true
+        prefs.edit().putString("acc.$id.pin", b64(pin)).commit()
     }
 
     fun unlockCount(id: String) = prefs.getInt("acc.$id.count", 0)
     fun lastUnlock(id: String) = prefs.getLong("acc.$id.last", 0L)
 
-    fun recordUnlock(id: String) {
+    fun recordUnlock(id: String) = synchronized(lock) {
         prefs.edit()
             .putInt("acc.$id.count", unlockCount(id) + 1)
             .putLong("acc.$id.last", System.currentTimeMillis())
             .apply()
     }
 
-    var invalidated: Set<String>
+    val invalidated: Set<String>
         get() = prefs.getStringSet(K_INVALIDATED, emptySet())
-        set(v) = prefs.edit().putStringSet(K_INVALIDATED, v).apply()
+
+    fun addInvalidated(ids: Set<String>) = synchronized(lock) {
+        prefs.edit().putStringSet(K_INVALIDATED, invalidated + ids).apply()
+    }
+
+    fun addInvalidated(id: String) = addInvalidated(setOf(id))
 
     fun timestamps(key: String): List<Long> =
         prefs.getString("rate.$key", "")!!.split(',').filter { it.isNotEmpty() }.map { it.toLong() }
@@ -129,7 +163,7 @@ class Prefs(context: Context) {
 
     fun history(): List<String> = prefs.getString(K_HISTORY, "")!!.lines().filter { it.isNotEmpty() }
 
-    fun addHistory(label: String, result: String) {
+    fun addHistory(label: String, result: String) = synchronized(lock) {
         val line = "${System.currentTimeMillis()}|$label|$result"
         val lines = (listOf(line) + history()).take(50)
         prefs.edit().putString(K_HISTORY, lines.joinToString("\n")).apply()
@@ -144,6 +178,9 @@ class Prefs(context: Context) {
     private fun b64(v: ByteArray) = Base64.encodeToString(v, Base64.NO_WRAP)
 
     companion object {
+        /** One for the process: every `Prefs` is a view of the same file. */
+        private val lock = Any()
+
         private const val K_PHONE_PRIVATE = "phone.private"
         private const val K_PC_PUB = "pc.pub"
         private const val K_PAIRING_ID = "pairing.id"
@@ -155,6 +192,8 @@ class Prefs(context: Context) {
         private const val K_ACCOUNTS = "accounts"
         private const val K_INVALIDATED = "invalidated"
         private const val K_HISTORY = "history"
+        private const val K_LIMIT_ACCOUNT = "limit.account"
+        private const val K_LIMIT_OVERALL = "limit.overall"
 
         fun hex(id: ByteArray) = id.joinToString("") { "%02x".format(it) }
     }

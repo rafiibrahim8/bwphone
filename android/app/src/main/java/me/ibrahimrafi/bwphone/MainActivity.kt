@@ -45,13 +45,10 @@ class MainActivity : BaseActivity() {
                 Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, "package:$packageName".toUri())
             )
             override fun fixNotifications() = allowNotifications()
-            override fun notificationSettings() = startActivity(
-                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
-            )
+            override fun settings() = startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
             override fun revoke(accountHex: String) {
                 Keystore.delete(accountHex)
                 prefs.removeAccount(accountHex)
-                prefs.invalidated = prefs.invalidated - accountHex
             }
             override fun revokeAll() {
                 for (id in prefs.accountIds()) Keystore.delete(id)

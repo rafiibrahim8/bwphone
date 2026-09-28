@@ -2,8 +2,11 @@ package me.ibrahimrafi.bwphone
 
 /**
  * A hard cap per hour: overall, and per account, so spreading requests
- * across accounts buys no extra attempts. Counts every request that reaches
- * the prompt stage, approved or not; survives restarts.
+ * across accounts buys no extra attempts. The two numbers are set on the
+ * phone's Settings screen (never by the PC). Counts every request that reaches
+ * the prompt stage, approved or not; survives restarts. A request refused
+ * here is not counted: otherwise someone asking once every few minutes
+ * would keep the window full, and every real unlock refused, for good.
  *
  * Also keeps the count of "unexplained" sessions: connections that finished
  * the Noise handshake — so they held the PC's key — and then asked for
@@ -11,15 +14,21 @@ package me.ibrahimrafi.bwphone
  * and opening sessions until one has the emoji they want does not.
  */
 class RateLimit(private val prefs: Prefs) {
-    /** Records the attempt and says whether it may proceed. */
+    /** Whether a prompt may be shown now; records it only if so. */
     @Synchronized
     fun allow(accountHex: String): Boolean {
         val now = System.currentTimeMillis()
         val overall = prune(prefs.timestamps("overall"), now)
         val account = prune(prefs.timestamps(accountHex), now)
+        if (overall.size >= prefs.limitOverall || account.size >= prefs.limitPerAccount) {
+            // Refused: keep the pruned windows, add nothing, so they drain.
+            prefs.putTimestamps("overall", overall)
+            prefs.putTimestamps(accountHex, account)
+            return false
+        }
         prefs.putTimestamps("overall", overall + now)
         prefs.putTimestamps(accountHex, account + now)
-        return overall.size < OVERALL_PER_HOUR && account.size < ACCOUNT_PER_HOUR
+        return true
     }
 
     /** Faster than a person plausibly unlocks: the prompt should look different. */
@@ -39,8 +48,12 @@ class RateLimit(private val prefs: Prefs) {
     private fun prune(ts: List<Long>, now: Long) = ts.filter { it > now - 3_600_000 }
 
     companion object {
-        const val OVERALL_PER_HOUR = 30
-        const val ACCOUNT_PER_HOUR = 10
+        /** Prompts per hour, as the Settings screen sets them; these are the defaults. */
+        const val DEFAULT_OVERALL = 30
+        const val DEFAULT_PER_ACCOUNT = 20
+        /** The most either can be set to: past this a cap no longer bounds anything. */
+        const val MAX_OVERALL = 100
+        const val MAX_PER_ACCOUNT = 50
         const val SUSPICIOUS_PER_MINUTE = 3
     }
 }

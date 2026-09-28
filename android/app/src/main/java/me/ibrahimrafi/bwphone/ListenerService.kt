@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.os.IBinder
 import android.os.PowerManager
@@ -45,6 +46,8 @@ class ListenerService : Service() {
     /** At most [MAX_SESSIONS] connections in flight; more are refused at accept, not queued. */
     private val sessions = ThreadPoolExecutor(0, MAX_SESSIONS, 30, TimeUnit.SECONDS, SynchronousQueue())
     private var wifi: Network? = null
+    /** The address the listener is bound to; null while it holds no socket. */
+    private var boundIp: Inet4Address? = null
 
     /** Accepts per source address in the current minute: one stranger cannot use up the PC's share. */
     private val attemptsBySource = HashMap<String, Int>()
@@ -55,6 +58,16 @@ class ListenerService : Service() {
             if (!Net.isWifi(cm, network)) return
             wifi = network
             bind(network)
+        }
+
+        /**
+         * The address can come after `onAvailable` (DHCP still running), or
+         * change on the same network (a new lease): follow it, or the listener
+         * stays bound to an address the phone no longer has.
+         */
+        override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+            if (network != wifi) return
+            if (Net.ipv4(cm, network) != boundIp) bind(network)
         }
 
         override fun onLost(network: Network) {
@@ -111,7 +124,7 @@ class ListenerService : Service() {
     /** Both invalidation paths surface at `cipher.init`; find out now, not while someone watches a spinner. */
     private fun probeKeys() {
         val bad = prefs.accountIds().filterNot { Keystore.probe(it) }.toSet()
-        if (bad.isNotEmpty()) prefs.invalidated = prefs.invalidated + bad
+        if (bad.isNotEmpty()) prefs.addInvalidated(bad)
     }
 
     @Synchronized
@@ -122,15 +135,32 @@ class ListenerService : Service() {
             updateNotification(getString(R.string.not_paired))
             return
         }
-        val ip = Net.ipv4(cm, network) ?: return
+        val ip = Net.ipv4(cm, network)
+        if (ip == null) {
+            // No IPv4 address yet: onLinkPropertiesChanged binds once one arrives.
+            AppState.listener.value = AppState.Listener.OffWifi
+            updateNotification(getString(R.string.not_on_wifi))
+            Log.i(TAG, "on Wi-Fi without an IPv4 address yet")
+            return
+        }
         val s = ServerSocket()
         s.reuseAddress = true
         try {
-            s.bind(InetSocketAddress(ip, prefs.listenPort), 8)
+            try {
+                s.bind(InetSocketAddress(ip, prefs.listenPort), 8)
+            } catch (e: Exception) {
+                s.bind(InetSocketAddress(ip, 0), 8)   // port taken: an ephemeral one, announced in the hello
+            }
         } catch (e: Exception) {
-            s.bind(InetSocketAddress(ip, 0), 8)   // port taken: an ephemeral one, announced in the hello
+            // Thrown here it would take the app down on the system's network thread.
+            try { s.close() } catch (_: Exception) {}
+            AppState.listener.value = AppState.Listener.OffWifi
+            updateNotification(getString(R.string.not_on_wifi))
+            Log.w(TAG, "could not listen on $ip: $e")
+            return
         }
         server = s
+        boundIp = ip
         acceptThread = Thread({ acceptLoop(s) }, "bwphone-accept").apply { isDaemon = true; start() }
         AppState.listener.value = AppState.Listener.Listening(ip.hostAddress ?: "", s.localPort)
         updateNotification(getString(R.string.listening))
@@ -142,6 +172,7 @@ class ListenerService : Service() {
     private fun unbind() {
         try { server?.close() } catch (_: Exception) {}
         server = null
+        boundIp = null
         acceptThread = null
     }
 

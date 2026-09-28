@@ -1,6 +1,8 @@
-//! The control socket: one JSON line in, one JSON line out, from
-//! `bwphone-hello` (the phone's address) and the CLI (status, a dry-run
-//! unlock that prints a fingerprint and never a key).
+//! The control socket: one JSON line in, one JSON line out, from the CLI
+//! (status, a dry-run unlock that prints a fingerprint and never a key, and
+//! `bwphone hello`). `bwphone-hello` does not come here: it has its own
+//! socket and plain-text protocol (`hellosock`), which reuses [`handle`] for
+//! the address it hands in.
 
 use std::{net::IpAddr, sync::Arc};
 
@@ -60,6 +62,7 @@ pub async fn handle(ctx: &Ctx, request: ControlRequest) -> Value {
                 }
                 p.last_hello_seq = seq;
                 p.last_address = Some(ip);
+                p.last_port = Some(port);
                 if let Some(path) = &ctx.pairing_path
                     && let Err(e) = p.save(path)
                 {

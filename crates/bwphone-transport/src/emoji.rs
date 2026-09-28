@@ -27,7 +27,7 @@ use rand::seq::SliceRandom as _;
 use sha2::Sha256;
 
 /// 16 food, 16 faces. 32 = 2^5, so five bits pick one with no bias. Nothing
-/// newer than Emoji 11, so Android 12 and Noto Color Emoji both draw them.
+/// newer than Emoji 11, so Android 9 and Noto Color Emoji both draw them.
 pub const EMOJI: [&str; 32] = [
     "🍎", "🍌", "🍇", "🍉", "🍓", "🍍", "🥑", "🥕", "🌽", "🥦", "🧀", "🍕", "🍔", "🍩", "🍪", "🍦",
     "😀", "😂", "😍", "😎", "😇", "🙃", "🤓", "😡", "😱", "😴", "🤔", "🤢", "🤡", "🤠", "🥶", "🥳",

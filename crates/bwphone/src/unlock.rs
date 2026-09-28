@@ -20,8 +20,8 @@ use crate::{
 
 /// The extension abandons a request after this.
 pub const EXTENSION_TIMEOUT: Duration = Duration::from_secs(60);
-/// The most a person gets, pocket to fingerprint. The spec says "up to
-/// 50 s"; 45 s leaves real headroom at the 60 s edge (5 + 45 + 10).
+/// The most a person gets, pocket to fingerprint: 5 + 45 + 10 is the
+/// extension's 60 s exactly.
 pub const HUMAN_MAX: Duration = Duration::from_secs(45);
 /// Left for the GCM open, the reply and scheduling jitter before the
 /// extension's 60 s cutoff. The spec's figure.
@@ -63,6 +63,9 @@ pub enum Reason {
     UsePassword,
     /// The blob failed authentication under the returned `K_wrap`.
     Tampered,
+    /// Whoever asked went away (the browser closed its pipe) and nobody
+    /// else is waiting for this account.
+    Abandoned,
     /// The account's Keystore key is gone; re-enrol.
     Invalidated,
 }
@@ -122,6 +125,11 @@ impl Queue {
         }
     }
 
+    /// Someone still waiting for this account, behind the job being run.
+    fn has_waiting(&self, account_id: &[u8; 16]) -> bool {
+        self.jobs.lock().unwrap().iter().any(|j| j.account_id == *account_id && !j.reply.is_closed())
+    }
+
     /// Everything waiting for the same account: two browsers share one answer.
     fn drain_account(&self, account_id: &[u8; 16]) -> Vec<Job> {
         let mut jobs = self.jobs.lock().unwrap();
@@ -148,10 +156,18 @@ pub async fn request(ctx: &Ctx, account_id: [u8; 16]) -> Outcome {
 
 pub async fn worker(ctx: Arc<Ctx>) {
     loop {
-        let job = ctx.queue.pop().await;
-        let outcome = run(&ctx, &job).await;
+        let mut job = ctx.queue.pop().await;
+        // The browser left while this sat in the queue: do not ask the phone for nobody.
+        if job.reply.is_closed() {
+            tracing::info!(account = %crate::accounts::id_hex(&job.account_id), "unlock abandoned before it started");
+            continue;
+        }
+        let outcome = run(&ctx, &mut job).await;
         if let Outcome::Key(key) = &outcome {
             for other in ctx.queue.drain_account(&job.account_id) {
+                if other.reply.is_closed() {
+                    continue;
+                }
                 let outcome = if other.arrived.elapsed() + HEADROOM < EXTENSION_TIMEOUT {
                     Outcome::Key(key.clone())
                 } else {
@@ -172,7 +188,14 @@ fn outcome_name(o: &Outcome) -> String {
     }
 }
 
-async fn run(ctx: &Ctx, job: &Job) -> Outcome {
+/// How the human phase ended.
+enum End {
+    Answer(Answer),
+    UsePassword,
+    Abandoned,
+}
+
+async fn run(ctx: &Ctx, job: &mut Job) -> Outcome {
     let refused = |r| Outcome::Refused(r);
     let Some(account) = ctx.accounts.by_id(&job.account_id) else { return refused(Reason::NoAccount) };
 
@@ -213,6 +236,17 @@ async fn run(ctx: &Ctx, job: &Job) -> Outcome {
                 .await;
             return refused(Reason::Busy);
         }
+        Err(ReachFailure::Refused(Status::RateLimited)) => {
+            ctx.state.lock().unwrap().note_reach(true);
+            // Refused before any prompt, so the phone shows nothing: say it here.
+            ctx.notifier
+                .warn(
+                    "Your phone refused: too many unlock requests in the last hour",
+                    "Unless you have unlocked that often yourself, someone else has been asking. Press Revoke on the phone. The limits are in BW Phone's settings.",
+                )
+                .await;
+            return refused(Reason::PhoneRefused(Status::RateLimited));
+        }
         Err(ReachFailure::Refused(Status::Invalidated)) => {
             let mut state = ctx.state.lock().unwrap();
             state.note_reach(true);
@@ -231,15 +265,38 @@ async fn run(ctx: &Ctx, job: &Job) -> Outcome {
     };
 
     let mut prompt = ctx.notifier.unlock_prompt(&account.label, reached.emoji).await;
-    let answer = tokio::select! {
-        answer = reached.answer(human + Duration::from_secs(1)) => Some(answer),
-        _ = prompt.use_password() => None,
+    let answer = reached.answer(human + Duration::from_secs(1));
+    tokio::pin!(answer);
+    // If the browser that asked goes away, its prompt comes down (dropping the
+    // session tells the phone), unless another request for this account is
+    // queued behind it and would take the same answer.
+    let mut asker_gone = false;
+    let end = loop {
+        tokio::select! {
+            answer = &mut answer => break End::Answer(answer),
+            _ = prompt.use_password() => break End::UsePassword,
+            _ = job.reply.closed(), if !asker_gone => {
+                if !ctx.queue.has_waiting(&account.id) {
+                    break End::Abandoned;
+                }
+                asker_gone = true;
+            }
+        }
     };
     prompt.close().await;
 
+    match end {
+        End::UsePassword => refused(Reason::UsePassword),
+        End::Abandoned => refused(Reason::Abandoned),
+        End::Answer(answer) => settle(ctx, account, answer).await,
+    }
+}
+
+/// The phone's final answer to a prompt that was shown.
+async fn settle(ctx: &Ctx, account: &crate::accounts::Account, answer: Answer) -> Outcome {
+    let refused = |r| Outcome::Refused(r);
     match answer {
-        None => refused(Reason::UsePassword),
-        Some(Answer::KWrap(k_wrap)) => match bwphone_wrap::unwrap(&account.blob, &k_wrap) {
+        Answer::KWrap(k_wrap) => match bwphone_wrap::unwrap(&account.blob, &k_wrap) {
             Ok(user_key) => Outcome::Key(Arc::new(user_key)),
             Err(_) => {
                 ctx.notifier
@@ -248,7 +305,7 @@ async fn run(ctx: &Ctx, job: &Job) -> Outcome {
                 refused(Reason::Tampered)
             }
         },
-        Some(Answer::Refused(Status::Rejected)) => {
+        Answer::Refused(Status::Rejected) => {
             ctx.notifier
                 .warn(
                     "Someone else asked your phone to unlock",
@@ -257,14 +314,14 @@ async fn run(ctx: &Ctx, job: &Job) -> Outcome {
                 .await;
             refused(Reason::Rejected)
         }
-        Some(Answer::Refused(Status::Denied)) => refused(Reason::Denied),
-        Some(Answer::Refused(Status::Expired)) | Some(Answer::TimedOut) => refused(Reason::Expired),
-        Some(Answer::Refused(Status::Invalidated)) => {
+        Answer::Refused(Status::Denied) => refused(Reason::Denied),
+        Answer::Refused(Status::Expired) | Answer::TimedOut => refused(Reason::Expired),
+        Answer::Refused(Status::Invalidated) => {
             ctx.state.lock().unwrap().invalidated.insert(account.id);
             refused(Reason::Invalidated)
         }
-        Some(Answer::Refused(status)) => refused(Reason::PhoneRefused(status)),
-        Some(Answer::Protocol(what)) => {
+        Answer::Refused(status) => refused(Reason::PhoneRefused(status)),
+        Answer::Protocol(what) => {
             tracing::warn!("phone session broke after the prompt: {what}");
             refused(Reason::Unreachable)
         }

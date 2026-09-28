@@ -112,6 +112,9 @@ pub struct FakePhone {
     /// A key to hand out at the next `enrol_begin`, so tests need not
     /// generate RSA-2048 in a debug build.
     next_enrol_key: Mutex<Option<RsaPrivateKey>>,
+    /// Refuse the next unwrap with this status after the pin check, as the
+    /// real phone does for limits the fake does not model (`rate_limited`).
+    refuse_next: Mutex<Option<Status>>,
     pub events: Mutex<Vec<Event>>,
 }
 
@@ -126,6 +129,7 @@ impl FakePhone {
             busy: AtomicBool::new(false),
             person,
             next_enrol_key: Mutex::new(None),
+            refuse_next: Mutex::new(None),
             events: Mutex::new(Vec::new()),
         }
     }
@@ -151,6 +155,10 @@ impl FakePhone {
 
     pub fn set_next_enrol_key(&self, key: RsaPrivateKey) {
         *self.next_enrol_key.lock().unwrap() = Some(key);
+    }
+
+    pub fn refuse_next_unwrap(&self, status: Status) {
+        *self.refuse_next.lock().unwrap() = Some(status);
     }
 
     pub fn events(&self) -> Vec<Event> {
@@ -214,6 +222,12 @@ impl FakePhone {
                 if !pin.is_some_and(|p| p.matches(&rsa_ct)) {
                     self.record(Event::Refused { account: Some(id), status: Status::PinMismatch });
                     let _ = ch.send_json(&Response::status(&req_id, Status::PinMismatch)).await;
+                    return;
+                }
+                let forced = self.refuse_next.lock().unwrap().take();
+                if let Some(status) = forced {
+                    self.record(Event::Refused { account: Some(id), status });
+                    let _ = ch.send_json(&Response::status(&req_id, status)).await;
                     return;
                 }
                 if self.busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {

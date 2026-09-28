@@ -133,10 +133,17 @@ mac = HMAC-SHA256(key[32..64], iv || ct)
 {"encryptedString": "2.<iv>|<ct>|<mac>", "encryptionType": 2, "iv", "data", "mac"}
 ```
 
-The MAC is checked first, in constant time. Encrypted traffic before a
-handshake, from another `appId`, or failing the MAC gets
-`{"command":"invalidateEncryption", "appId"}`, and the extension handshakes
-again.
+The MAC is checked first, in constant time. An encrypted message that
+fails it gets `{"command":"invalidateEncryption", "appId"}` with the channel's
+`appId`; the extension then drops the pipe, wipes its key and handshakes
+again. Encrypted traffic with no channel yet is not answered, and traffic
+from another `appId` drops the channel with an `invalidateEncryption` for the
+channel's own `appId`. The extension never sends either: it wipes its key
+whenever the pipe closes and runs `setupEncryption` before its first
+encrypted message on a new one, and its `appId` is fixed per install while
+each browser has its own pipe. (The field exists because Bitwarden's
+desktop app serves several browsers on one channel; the extension ignores an
+`invalidateEncryption` for another `appId`.)
 
 **Commands and replies.** An encrypted request carries `command`,
 `messageId`, `userId` and `timestamp`. A request whose timestamp is more than
@@ -144,18 +151,28 @@ again.
 
 | Command | Reply |
 |---|---|
-| `getBiometricsStatus` | `0` (Available) if the first enrolled account can plausibly be unlocked now, else `2` (HardwareUnavailable); `8` (NotEnabledInConnectedDesktopApp) with no account |
+| `getBiometricsStatus` | `0` (Available) if the first account the daemon loaded can plausibly be unlocked now, else `2` (HardwareUnavailable); `8` (NotEnabledInConnectedDesktopApp) with no account. "First" is directory order, which is arbitrary; it changes the answer only when one account is invalidated and another is not |
 | `getBiometricsStatusForUser` | The same, for that `userId` |
 | `unlockWithBiometricsForUser` | `{"response": true, "userKeyB64": …}`, or `{"response": false}` at once for an unenrolled `userId` and for every failure |
 | `authenticateWithBiometrics` | `false` |
 | `canEnableBiometricUnlock` | `true` for an enrolled `userId` |
 | anything else | `false` |
 
+The extension asks `getBiometricsStatus` (no `userId`) only for two
+things: whether its "Unlock with biometrics" setting may be switched on
+(refused on `2` and `8`), and whether its "verify your identity" dialogs
+offer biometrics (only on `0`; that choice then fails, since
+`authenticateWithBiometrics` is `false`). Its lock screen asks
+`getBiometricsStatusForUser`.
+
 `authenticateWithBiometrics` is what the extension uses for its "verify your
-identity" dialogs, including passkey user verification. Answering `true`
-without a phone round-trip would turn every one of them into a no-op, so it
-answers `false` and the extension falls back to the PIN or the master
-password. A real verify request to the phone is future work.
+identity" dialogs, and what passkey user verification will use once the
+extension turns it on (in `browser-v2026.9.0` an unlocked vault counts as
+verified for a passkey, unless the item asks for a master-password
+re-prompt). Answering `true` without a phone round-trip would turn every one
+of them into a no-op, so it answers `false` and the extension falls back to
+the PIN or the master password. A real verify request to the phone is future
+work.
 
 "Plausibly" means: the account is enrolled and not invalidated, the wallet
 gives the Noise key, the phone's address is known, and the last reach did not
@@ -165,6 +182,16 @@ one `ping`, so availability recovers without polling.
 **Timestamps.** A reply's inner `timestamp` is stamped when it is sealed, not
 when the request arrived, so a 40 s wait on the phone never produces a reply
 the extension drops as stale. The extension abandons a request after 60 s.
+
+**The SDK IPC channel.** The extension also opens a second port to the
+same host, for Bitwarden's SDK IPC (`bitwarden-ipc`: a JSON envelope
+`{"type":"bitwarden-ipc-message", …}` around CBOR frames of an
+unauthenticated Noise NN channel). bwphone does not speak it: those frames
+fail to parse as native messaging, are logged and dropped, and the
+extension's discover request on that port times out. With the server-side
+`biometrics-sdk-ipc` flag on, the extension asks for status, unlock and
+verification over that channel only, so bwphone can no longer serve it (see
+[Known limits](#15-known-limits)).
 
 **Concurrency.** Requests on one pipe are handled concurrently (the extension
 keeps polling status while an unlock waits on the phone); replies go out
@@ -245,7 +272,10 @@ reach budget; the only long wait is the one where it already is.
 arrival order; one that would get less than 15 s of human phase is refused at
 once. When an unlock succeeds, queued requests for the same account share the
 answer (two browsers on one account need one fingerprint), if their own
-deadline still allows.
+deadline still allows. A request whose browser has closed its pipe is
+dropped: skipped if it is still queued, and if its prompt is up, the
+session is closed (which takes the prompt down on the phone) unless another
+request for the same account is queued behind it.
 
 ## 5. Pairing
 
@@ -299,7 +329,7 @@ the handshake and send its PairHello within 10 s, and the PC waits up to
 **What is stored.** PC: the Noise private key and `hello_key` go straight
 into the wallet (they never touch a file); `pairing.json` records the phone's
 public key, `pairing_id`, device label, date, listen port, hello port, last
-address and last hello `seq`. Because every existing blob was wrapped to keys
+address, the port the last hello announced, and last hello `seq`. Because every existing blob was wrapped to keys
 the old phone held, `pair` deletes `accounts/`: nothing is served until a
 fresh enrollment has round-tripped. Phone: its X25519 private key, the
 PC's public key, `pairing_id`, `hello_key`, the PC's address and the
@@ -345,8 +375,13 @@ tap succeeds one time in five.
 
 **Alarms.** A `busy` answer when the daemon has nothing else at the phone
 means someone else is asking; the PC warns "Another unlock request is
-waiting on your phone". A `rejected` (None of these) warns "Someone else asked
-your phone to unlock". The phone also counts sessions in the last hour that
+waiting on your phone". One false alarm is known: `bwphone enroll` runs its
+self-test unwrap from its own process, not through the daemon, so a browser
+unlock during that self-test gets `busy` and raises this warning although
+the request on the phone is your own. A `rejected` (None of these) warns "Someone else asked
+your phone to unlock". A `rate_limited` warns "Your phone refused: too many
+unlock requests in the last hour", since the phone refuses it before any
+prompt and shows nothing. The phone also counts sessions in the last hour that
 finished the handshake and then asked for nothing (someone grinding sessions
 for a chosen emoji does exactly that) and shows the count on the next pick.
 
@@ -499,7 +534,9 @@ screen. Back and the close button leave the screen with the window running.
 
 It is refused with `label_taken` for a name the phone already has, compared
 case-insensitively, so a second account cannot pose as the first in the
-prompt. `bwphone enroll` reports that by name, and the plain `not_allowed` as
+prompt. That check comes after the window's: outside an open window every
+refusal is `not_allowed`, so the PC's key alone cannot learn which names the
+phone holds. `bwphone enroll` reports that by name, and the plain `not_allowed` as
 "unlock the phone and open BW Phone". The unlock pick never gives way to the
 Enrol screen.
 
@@ -517,7 +554,7 @@ stateDiagram-v2
   SelfTest --> Done: self-test unlock ok
   SelfTest --> Failed: self-test denied, expired or dropped
   Waiting --> Closed: three minutes pass
-  Compare --> Closed: three minutes pass, set_pin refused
+  Compare --> Closed: three minutes pass, key and account deleted
   Waiting --> Closed: Cancel or Done
   Compare --> Closed: Cancel, key and account deleted
   SelfTest --> Closed: Cancel, key and account deleted
@@ -538,7 +575,9 @@ the phone from decrypting any ciphertext other than the one enrolled: an
 key made but not pinned, or pinned and awaiting the self-test. The PC's
 next message is then refused, and `enroll` removes its own directory. A key
 still being made when Cancel is pressed is deleted as soon as it exists, and
-`enrol_begin` is answered `not_allowed`.
+`enrol_begin` is answered `not_allowed`. A window that runs out with a key
+still waiting for its pin is undone the same way: nothing can pin that key
+any more.
 
 ## 9. The vault blob
 
@@ -620,8 +659,12 @@ In order, for an `unwrap`:
    `pin_mismatch`, without a prompt.
 3. **Invalidation**: `invalidated`, without a prompt.
 4. **One request in flight**: a second is answered `busy` at once.
-5. **Rate limit**: 30 prompts per hour overall and 10 per account; over it,
-   `rate_limited`. At 3 or more in the last minute the prompt says requests
+5. **Rate limit**: prompts per hour, 20 per account and 30 overall by
+   default; over it, `rate_limited`. Both are set on the phone's Settings
+   screen (per account 1–50, overall from the per-account value up to 100),
+   never by the PC; Revoke all resets them. Only prompts count: a refused request is not recorded,
+   so the window drains an hour after the last prompt however often someone
+   keeps asking. At 3 or more in the last minute the prompt says requests
    are arriving faster than usual.
 6. **Deadline**: `expires_in_ms`, clamped to 1–60 s; when it passes the prompt
    is cancelled and `K_wrap` is never sent.
@@ -716,7 +759,7 @@ screen unlock sends a fresh hello.
 |---|---|---|---|
 | Noise static private key | wallet item `service=bwphone`, `key=noise-static` | The wallet (ksecretd), unlocked by the login password | Speaking to the phone as the PC |
 | `hello_key` | wallet item `service=bwphone`, `key=hello` | The wallet | Decrypting address announcements, computing the mDNS name |
-| `pairing.json` | `~/.local/share/bwphone/` | Not secret | Phone's X25519 public key, `pairing_id`, device label, date, ports, last address, last hello `seq` |
+| `pairing.json` | `~/.local/share/bwphone/` | Not secret | Phone's X25519 public key, `pairing_id`, device label, date, ports, last address and port, last hello `seq` |
 | `vault.blob` | `accounts/<account_id>/`, 0400, directory 0700 | Inert without the phone | That account's wrapped user key |
 | `phone.rsa.pub` | same directory | Not secret | The account's RSA public key, SPKI DER |
 | `account.json` | same directory | Not secret | Bitwarden `userId` and label, for routing |
@@ -752,6 +795,7 @@ fails to open.
 | Per account: label, pin (`SHA-256(rsa_ct)`), unlock count, last unlock time | Sealed prefs |
 | Invalidated accounts | Sealed prefs |
 | Rate-limit timestamps, unexplained-session timestamps | Sealed prefs; survive restarts |
+| Unlock limits (per account, overall) | Sealed prefs; read clamped to their ranges |
 | History, last 50 events | Sealed prefs; shown on Home |
 
 The phone holds nothing Bitwarden-specific: an account is a random 16-byte id
@@ -854,6 +898,11 @@ here only on the fallback. Neither resists same-user malware.
 - **Protocol drift.** Bitwarden's browser-to-desktop IPC is not a stable
   interface; the implementation follows `browser-v2026.9.0` and fails loudly
   on a shape it does not know.
+- **The `biometrics-sdk-ipc` flag.** When Bitwarden turns it on (from its
+  servers, with no extension update), the extension moves biometrics to the
+  SDK IPC channel, which bwphone does not speak. Nothing warns: the extension
+  reports the desktop app as disconnected, and every unlock falls back to the
+  master password.
 - **The real desktop app overwrites the manifests**; the daemon warns at
   start, and `bwphone manifests write` puts them back.
 - **IPv4 only** for the hello and the mDNS answer.

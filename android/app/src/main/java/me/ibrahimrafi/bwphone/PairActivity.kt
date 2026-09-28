@@ -1,9 +1,12 @@
 package me.ibrahimrafi.bwphone
 
+import android.app.Application
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -31,6 +34,11 @@ import uniffi.bwphone_android.parsePairConfirm
  * the PSK (so a relay cannot complete the handshake), send our X25519 key
  * in the PairHello, show the six words, and commit only when both sides
  * have sent and received `true`.
+ *
+ * The session lives in [PairModel], not the activity: turning the phone or
+ * any other configuration change rebuilds the screen, and that must neither
+ * answer "no" for the person nor cut the new screen off from the session.
+ * Only leaving the screen for good does that.
  */
 class PairActivity : BaseActivity() {
     sealed interface Ui {
@@ -44,43 +52,36 @@ class PairActivity : BaseActivity() {
         object AlreadyPaired : Ui
     }
 
-    private val ui = MutableStateFlow<Ui>(Ui.Scanning)
-    private var answer: CompletableFuture<Boolean>? = null
-    private lateinit var prefs: Prefs
+    private val model: PairModel by viewModels()
 
     private val scanner = registerForActivityResult(ScanContract()) { result ->
         val text = result.contents
         if (text == null) { finish(); return@registerForActivityResult }
-        Thread { pair(text) }.start()
+        model.start(text)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        prefs = Prefs(this)
         setContent {
             BwTheme {
-                val state by ui.collectAsStateWithLifecycle()
+                val state by model.ui.collectAsStateWithLifecycle()
                 PairScreen(
                     ui = state,
-                    onMatch = { answer?.complete(true) },
-                    onNoMatch = { answer?.complete(false) },
-                    onScanAgain = { ui.value = Ui.Scanning; scan() },
-                    onClose = { answer?.complete(false); finish() },
+                    onMatch = { model.answer(true) },
+                    onNoMatch = { model.answer(false) },
+                    onScanAgain = { model.ui.value = Ui.Scanning; scan() },
+                    onClose = { model.answer(false); finish() },
                 )
             }
         }
-        if (prefs.isPaired) {
+        // A rebuilt screen picks up where the session is; only a fresh one starts.
+        if (savedInstanceState != null) return
+        if (Prefs(this).isPaired) {
             // Exactly one pairing: a second requires Revoke all first.
-            ui.value = Ui.AlreadyPaired
+            model.ui.value = Ui.AlreadyPaired
             return
         }
-        if (savedInstanceState == null) scan()
-    }
-
-    override fun onDestroy() {
-        // Leaving mid-confirmation is a "no": nothing is stored.
-        answer?.complete(false)
-        super.onDestroy()
+        scan()
     }
 
     private fun scan() {
@@ -91,14 +92,56 @@ class PairActivity : BaseActivity() {
             setOrientationLocked(false)
         })
     }
+}
+
+/**
+ * One pairing session, outliving any single [PairActivity] instance. Cleared
+ * only when the screen is left for good, which answers "no" if the person
+ * had not answered yet, so nothing is stored.
+ */
+class PairModel(app: Application) : AndroidViewModel(app) {
+    val ui = MutableStateFlow<PairActivity.Ui>(PairActivity.Ui.Scanning)
+    @Volatile
+    private var answer: CompletableFuture<Boolean>? = null
+    @Volatile
+    private var running = false
+    /** Set once the screen is gone for good: the session must stop, not wait for an answer. */
+    @Volatile
+    private var cleared = false
+    @Volatile
+    private var socket: Socket? = null
+
+    /** One session at a time; a scan result delivered twice does not start a second. */
+    @Synchronized
+    fun start(qrText: String) {
+        if (running) return
+        running = true
+        Thread({ try { pair(qrText) } finally { running = false } }, "bwphone-pair").start()
+    }
+
+    fun answer(confirmed: Boolean) {
+        answer?.complete(confirmed)
+    }
+
+    override fun onCleared() {
+        // Leaving mid-confirmation is a "no": nothing is stored. Closing the
+        // socket ends a session still connecting or waiting on the PC.
+        cleared = true
+        answer?.complete(false)
+        try { socket?.close() } catch (_: Exception) {}
+    }
 
     private fun pair(qrText: String) {
-        val qr = try { decodeQr(qrText) } catch (e: Exception) { ui.value = Ui.Failed(getString(R.string.pair_not_qr)); return }
-        val cm = Net.cm(this)
-        val network = Net.wifiNetwork(cm) ?: run { ui.value = Ui.Failed(getString(R.string.pair_no_wifi)); return }
-        ui.value = Ui.Connecting(qr.ip)
+        val app = getApplication<Application>()
+        val prefs = Prefs(app)
+        val qr = try { decodeQr(qrText) } catch (e: Exception) { ui.value = PairActivity.Ui.Failed(app.getString(R.string.pair_not_qr)); return }
+        val cm = Net.cm(app)
+        val network = Net.wifiNetwork(cm) ?: run { ui.value = PairActivity.Ui.Failed(app.getString(R.string.pair_no_wifi)); return }
+        ui.value = PairActivity.Ui.Connecting(qr.ip)
+        val socket = Socket()
+        this.socket = socket
         try {
-            val socket = Socket()
+            if (cleared) return
             network.bindSocket(socket)
             socket.connect(InetSocketAddress(qr.ip, qr.pairPort.toInt()), 10_000)
             socket.soTimeout = 30_000
@@ -131,13 +174,14 @@ class PairActivity : BaseActivity() {
             // Blocks this thread on the person's answer.
             val future = CompletableFuture<Boolean>()
             answer = future
-            ui.value = Ui.Confirm(qr.ip, words)
+            // The screen may have gone before there was anything to answer.
+            if (cleared) future.complete(false)
+            ui.value = PairActivity.Ui.Confirm(qr.ip, words)
             val confirmed = future.get()
             send(t.seal(encodePairConfirm(confirmed)))
-            if (confirmed) ui.value = Ui.WaitingForPc(qr.ip)
+            if (confirmed) ui.value = PairActivity.Ui.WaitingForPc(qr.ip)
             socket.soTimeout = 120_000
             val pcConfirmed = parsePairConfirm(t.open(next()))
-            socket.close()
 
             if (confirmed && pcConfirmed) {
                 prefs.commitPairing(
@@ -149,13 +193,16 @@ class PairActivity : BaseActivity() {
                     helloPort = qr.helloPort.toInt(),
                     listenPort = prefs.listenPort,
                 )
-                ui.value = Ui.Paired(qr.ip)
-                ListenerService.start(this)
+                ui.value = PairActivity.Ui.Paired(qr.ip)
+                ListenerService.start(app)
             } else {
-                ui.value = Ui.Cancelled
+                ui.value = PairActivity.Ui.Cancelled
             }
         } catch (e: Exception) {
-            if (ui.value !is Ui.Cancelled) ui.value = Ui.Failed(e.message ?: e.toString())
+            if (ui.value !is PairActivity.Ui.Cancelled) ui.value = PairActivity.Ui.Failed(e.message ?: e.toString())
+        } finally {
+            try { socket.close() } catch (_: Exception) {}
+            this.socket = null
         }
     }
 }

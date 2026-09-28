@@ -307,7 +307,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bwphone"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bwphone-fakephone",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "bwphone-android"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bwphone-transport",
  "rand",
@@ -349,14 +349,14 @@ dependencies = [
 
 [[package]]
 name = "bwphone-bindgen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "uniffi",
 ]
 
 [[package]]
 name = "bwphone-fakephone"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bwphone-transport",
  "bwphone-wrap",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "bwphone-hello"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bwphone-transport",
  "socket2 0.5.10",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "bwphone-nm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes 0.8.4",
  "base64",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "bwphone-proxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "tokio",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "bwphone-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bip39",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "bwphone-wrap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "rand",

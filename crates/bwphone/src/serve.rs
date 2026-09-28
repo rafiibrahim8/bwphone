@@ -25,6 +25,11 @@ pub const NOT_ENROLLED: BiometricsStatus = BiometricsStatus::NotEnabledInConnect
 /// Requests on one pipe are handled concurrently: an unlock can sit on
 /// the phone for most of a minute, and the extension keeps asking for
 /// status meanwhile. Replies go out through one writer, in completion order.
+///
+/// When the pipe closes (the browser idled its service worker out, or
+/// quit), the requests still in flight are aborted: nobody is left to read
+/// their answers, and an unlock abandoned this way leaves the queue, or
+/// takes its prompt down, instead of asking the phone for nothing.
 pub async fn serve_proxy<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: S, ctx: Arc<Ctx>) -> std::io::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Zeroizing<Vec<u8>>>(32);
@@ -37,8 +42,11 @@ pub async fn serve_proxy<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(str
     });
     let peer = Arc::new(tokio::sync::Mutex::new(Peer::new()));
     tx.send(Zeroizing::new(Peer::connected())).await.ok();
+    // Dropped with this function, on a clean end or an error: that aborts every request in it.
+    let mut requests = tokio::task::JoinSet::new();
 
     while let Some(frame) = read_frame(&mut reader).await? {
+        while requests.try_join_next().is_some() {}
         let event = peer.lock().await.receive(&frame, now_ms());
         match event {
             Ok(Event::Setup { reply, .. }) => {
@@ -46,7 +54,7 @@ pub async fn serve_proxy<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(str
             }
             Ok(Event::Request(request)) => {
                 let (ctx, peer, tx) = (ctx.clone(), peer.clone(), tx.clone());
-                tokio::spawn(async move {
+                requests.spawn(async move {
                     let reply = handle(&ctx, &request).await;
                     match peer.lock().await.reply(reply, now_ms()) {
                         Ok(bytes) => {
@@ -66,6 +74,8 @@ pub async fn serve_proxy<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(str
             Err(e) => tracing::warn!("bad frame from browser: {e}"),
         }
     }
+    // The browser is gone: abort what is still in flight, and wait for it to let go of the writer.
+    requests.shutdown().await;
     drop(tx);
     let _ = writer_task.await;
     Ok(())

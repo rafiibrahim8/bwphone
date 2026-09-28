@@ -128,7 +128,7 @@ pub async fn run(paths: &Paths, opts: EnrollOptions, ui: &mut dyn Ui) -> Result<
     let pairing = Pairing::load(&paths.pairing())?.ok_or(EnrollError::NotPaired)?;
     let addr = match opts.phone_addr {
         Some(a) => a,
-        None => pairing.last_address.map(|ip| SocketAddr::new(ip, pairing.phone_port)).ok_or(EnrollError::NoAddress)?,
+        None => pairing.last_phone_addr().ok_or(EnrollError::NoAddress)?,
     };
     let phone = Phone { public: pairing.phone_pub()?, pairing_id: pairing.pairing_id()?, host: crate::hostname() };
     let noise = secrets::read_item(secrets::NOISE_STATIC).await?;

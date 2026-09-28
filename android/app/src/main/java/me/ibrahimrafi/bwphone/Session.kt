@@ -105,7 +105,7 @@ class Session(
             reply(t, reqId, PhoneStatus.PIN_MISMATCH); return
         }
         if (prefs.invalidated.contains(id) || !Keystore.probe(id)) {
-            prefs.invalidated = prefs.invalidated + id
+            prefs.addInvalidated(id)
             reply(t, reqId, PhoneStatus.INVALIDATED); return
         }
         // The PC may ask for less; never more than the extension's own timeout.
@@ -155,7 +155,7 @@ class Session(
                     PendingRequest.Outcome.Denied -> { prefs.addHistory(pending.label, "denied"); reply(t, reqId, PhoneStatus.DENIED) }
                     PendingRequest.Outcome.Rejected -> { prefs.addHistory(pending.label, "rejected"); reply(t, reqId, PhoneStatus.REJECTED) }
                     PendingRequest.Outcome.Invalidated -> {
-                        prefs.invalidated = prefs.invalidated + id
+                        prefs.addInvalidated(id)
                         prefs.addHistory(pending.label, "invalidated")
                         reply(t, reqId, PhoneStatus.INVALIDATED)
                     }
@@ -177,6 +177,8 @@ class Session(
 
     private fun enrolBegin(t: Transport, reqId: String, r: PhoneRequest.EnrolBegin) {
         val id = Prefs.hex(r.account)
+        // A window that ran out with an unpinned key: clear it before judging this request.
+        EnrolState.expireIfNeeded(prefs)
         if (EnrolState.pendingAccount != null || prefs.hasAccount(id) || Keystore.hasKey(id)) {
             reply(t, reqId, PhoneStatus.NOT_ALLOWED); return
         }
@@ -185,24 +187,24 @@ class Session(
         if (hooks.phoneLocked() || PendingRequest.current != null) {
             reply(t, reqId, PhoneStatus.NOT_ALLOWED); return
         }
-        // The PC's --label is final; the reply must go out within its reach budget.
-        val label = r.labelHint.trim().take(32).ifEmpty { "Account" }
-        // One name, one account: a second "Work" could pose as the first in the prompt.
-        if (prefs.accountIds().any { prefs.label(it).equals(label, ignoreCase = true) }) {
-            if (EnrolState.isOpen()) {
-                EnrolState.phase.value = EnrolState.Phase.Failed(
-                    "This phone already has an account named $label. Revoke it first, or enrol with another --label."
-                )
-            }
-            // Its own status, so the PC can say exactly this.
-            reply(t, reqId, PhoneStatus.LABEL_TAKEN); return
-        }
+        // The window before anything else: outside one, every refusal looks the same, so
+        // the PC's key alone cannot learn which account names this phone holds.
         if (!EnrolState.isOpen()) {
             // With the app in front, the person is looking at it: open the window
             // and bring up the Enrol screen. Otherwise the PC cannot start one.
             if (!AppState.inForeground) { reply(t, reqId, PhoneStatus.NOT_ALLOWED); return }
-            EnrolState.open()
+            EnrolState.open(prefs)
             EnrolState.autoOpen.value = true
+        }
+        // The PC's --label is final; the reply must go out within its reach budget.
+        val label = r.labelHint.trim().take(32).ifEmpty { "Account" }
+        // One name, one account: a second "Work" could pose as the first in the prompt.
+        if (prefs.accountIds().any { prefs.label(it).equals(label, ignoreCase = true) }) {
+            EnrolState.phase.value = EnrolState.Phase.Failed(
+                "This phone already has an account named $label. Revoke it first, or enrol with another --label."
+            )
+            // Its own status, so the PC can say exactly this.
+            reply(t, reqId, PhoneStatus.LABEL_TAKEN); return
         }
         EnrolState.phase.value = EnrolState.Phase.Creating(label)
         val rsaPub = try {
@@ -211,34 +213,16 @@ class Session(
             EnrolState.phase.value = EnrolState.Phase.Failed("Couldn't create the key: ${e.message ?: e}")
             reply(t, reqId, PhoneStatus.ERROR); return
         }
-        if (!EnrolState.isOpen()) {
-            // Cancelled while the key was being made: undo it, and tell the PC no.
+        if (!EnrolState.adoptKey(prefs, id, label, shortFingerprint(rsaPub))) {
+            // Cancelled, or the window ran out, while the key was being made: undo it, and tell the PC no.
             Keystore.delete(id)
             reply(t, reqId, PhoneStatus.NOT_ALLOWED); return
         }
-        prefs.addAccount(id, label)
-        EnrolState.pendingAccount = id
-        EnrolState.phase.value = EnrolState.Phase.Compare(label, shortFingerprint(rsaPub))
         reply(t, reqId, PhoneStatus.OK, rsaPub = rsaPub, label = label)
     }
 
     private fun setPin(t: Transport, reqId: String, r: PhoneRequest.SetPin) {
-        val id = Prefs.hex(r.account)
-        val status = when {
-            !EnrolState.isOpen() || EnrolState.pendingAccount != id -> PhoneStatus.NOT_ALLOWED
-            !prefs.hasAccount(id) || !Keystore.hasKey(id) -> PhoneStatus.UNKNOWN_ACCOUNT
-            prefs.setPinOnce(id, r.pin) -> PhoneStatus.OK
-            else -> PhoneStatus.NOT_ALLOWED
-        }
-        if (status == PhoneStatus.OK) {
-            // One enrolment per window: pinned, so the window is done. The PC's
-            // self-test unlock comes next, and the Enrol screen waits for it.
-            val fingerprint = (EnrolState.phase.value as? EnrolState.Phase.Compare)?.fingerprint.orEmpty()
-            EnrolState.close()
-            EnrolState.selfTestAccount = id
-            EnrolState.phase.value = EnrolState.Phase.SelfTest(prefs.label(id), fingerprint)
-        }
-        reply(t, reqId, status)
+        reply(t, reqId, EnrolState.pin(prefs, Prefs.hex(r.account), r.pin))
     }
 
     private fun reply(

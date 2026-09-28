@@ -49,6 +49,7 @@
             android:screenOrientation="fullSensor"
             tools:replace="screenOrientation" />
         <activity android:name=".EnrolActivity" android:exported="false" />
+        <activity android:name=".SettingsActivity" android:exported="false" />
 
         <!-- Transparent, over the lock screen, never in recents: the emoji pick and the prompt. -->
         <activity

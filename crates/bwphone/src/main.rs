@@ -321,7 +321,7 @@ async fn daemon(foreground: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (phone, state) = match &pairing {
         Some(p) => (
             Phone { public: p.phone_pub()?, pairing_id: p.pairing_id()?, host: hostname() },
-            unlock::PhoneState { addr: p.last_address.map(|ip| (ip, p.phone_port).into()), ..Default::default() },
+            unlock::PhoneState { addr: p.last_phone_addr(), ..Default::default() },
         ),
         None => {
             tracing::warn!("not paired: serving unavailable until `bwphone pair` has run");
@@ -392,61 +392,9 @@ async fn daemon(foreground: bool) -> Result<(), Box<dyn std::error::Error>> {
     let hellos = socket::bind_private(&paths.hello_socket()).await?;
     tracing::info!(sock = %paths.proxy_socket().display(), ctl = %paths.control_socket().display(), hello = %paths.hello_socket().display(), "listening");
 
-    let accept_proxies = {
-        let ctx = ctx.clone();
-        async move {
-            loop {
-                let Ok((stream, _)) = proxies.accept().await else { continue };
-                if !socket::same_uid(&stream) {
-                    tracing::warn!("proxy socket: rejected a peer with another uid");
-                    continue;
-                }
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = bwphone::serve::serve_proxy(stream, ctx).await {
-                        tracing::info!("browser connection ended: {e}");
-                    }
-                });
-            }
-        }
-    };
-    let accept_controls = {
-        let ctx = ctx.clone();
-        async move {
-            loop {
-                let Ok((stream, _)) = controls.accept().await else { continue };
-                if !socket::same_uid(&stream) {
-                    tracing::warn!("control socket: rejected a peer with another uid");
-                    continue;
-                }
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = bwphone::control::serve_control(stream, ctx).await {
-                        tracing::info!("control connection ended: {e}");
-                    }
-                });
-            }
-        }
-    };
-
-    let accept_hellos = {
-        let ctx = ctx.clone();
-        async move {
-            loop {
-                let Ok((stream, _)) = hellos.accept().await else { continue };
-                if !socket::same_uid(&stream) {
-                    tracing::warn!("hello socket: rejected a peer with another uid");
-                    continue;
-                }
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = bwphone::hellosock::serve_hello_socket(stream, ctx).await {
-                        tracing::info!("hello connection ended: {e}");
-                    }
-                });
-            }
-        }
-    };
+    let accept_proxies = accept_loop(proxies, "proxy", ctx.clone(), bwphone::serve::serve_proxy);
+    let accept_controls = accept_loop(controls, "control", ctx.clone(), bwphone::control::serve_control);
+    let accept_hellos = accept_loop(hellos, "hello", ctx.clone(), bwphone::hellosock::serve_hello_socket);
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -460,6 +408,39 @@ async fn daemon(foreground: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(paths.control_socket());
     let _ = std::fs::remove_file(paths.hello_socket());
     Ok(())
+}
+
+/// Pause after a failed `accept()`, so a lasting error (out of file
+/// descriptors) is retried at a sane rate instead of spinning.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Accepts on one of the daemon's sockets forever: peers with another uid
+/// are dropped before a byte is read, the rest get their own task.
+async fn accept_loop<F, Fut>(listener: tokio::net::UnixListener, name: &'static str, ctx: Arc<Ctx>, serve: F)
+where
+    F: Fn(UnixStream, Arc<Ctx>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                tracing::warn!("{name} socket: accept failed: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
+        if !socket::same_uid(&stream) {
+            tracing::warn!("{name} socket: rejected a peer with another uid");
+            continue;
+        }
+        let connection = serve(stream, ctx.clone());
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::info!("{name} connection ended: {e}");
+            }
+        });
+    }
 }
 
 async fn control(request: ControlRequest) -> Result<(), Box<dyn std::error::Error>> {

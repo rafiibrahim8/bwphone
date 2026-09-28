@@ -54,6 +54,12 @@ class SealedPrefs(context: Context, name: String) {
             e.apply()
             AppState.changed()
         }
+        /** Like [apply], but on disk before it returns: for what must survive the process dying right after. */
+        fun commit(): Boolean {
+            val ok = e.commit()
+            AppState.changed()
+            return ok
+        }
     }
 
     private fun seal(name: String, plain: ByteArray): String {

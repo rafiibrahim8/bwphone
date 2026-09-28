@@ -17,6 +17,21 @@
     <string name="keep">Keep</string>
     <string name="more_options">More options</string>
 
+    <string name="settings">Settings</string>
+    <string name="settings_limits">Unlock limits</string>
+    <string name="settings_per_account">Per account</string>
+    <string name="settings_per_account_body">Prompts for one account in an hour</string>
+    <string name="settings_overall">All accounts</string>
+    <string name="settings_overall_body">Prompts in an hour, all accounts together</string>
+    <string name="settings_limits_body">Every prompt counts, approved or not; two browsers on one account share one. Past a limit the PC is refused before anything shows here. A refused request doesn\'t count, so a limit clears an hour after the prompts that filled it.</string>
+    <string name="settings_limits_risk">Higher limits give more tries to anyone with a copy of your PC\'s key. Each try still shows here and needs the right emoji and your fingerprint.</string>
+    <string name="settings_reset">Reset to %1$d and %2$d</string>
+    <string name="settings_decrease">Decrease %1$s</string>
+    <string name="settings_increase">Increase %1$s</string>
+    <string name="settings_value_desc">%1$s: %2$d</string>
+    <string name="settings_notifications">Notifications</string>
+    <string name="settings_notifications_body">Unlock requests, and the Listener notification, which you can switch off on its own</string>
+
     <string name="home_listening">Listening on Wi-Fi</string>
     <string name="home_off_wifi">Off Wi-Fi</string>
     <string name="home_not_paired">Not paired yet</string>

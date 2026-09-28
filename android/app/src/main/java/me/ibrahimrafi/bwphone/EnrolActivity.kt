@@ -25,8 +25,10 @@ class EnrolActivity : BaseActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // A fresh opening starts a fresh window, unless one is already running
         // (the PC started it) or the last one is waiting on its self-test.
+        val prefs = Prefs(this)
+        EnrolState.expireIfNeeded(prefs)
         if (savedInstanceState == null && !EnrolState.isOpen() && EnrolState.phase.value !is EnrolState.Phase.SelfTest) {
-            EnrolState.open()
+            EnrolState.open(prefs)
         }
         setContent {
             BwTheme {
@@ -37,8 +39,8 @@ class EnrolActivity : BaseActivity() {
                     openUntil = openUntil,
                     onClose = { finish() },
                     onDone = { EnrolState.close(); finish() },
-                    onCancel = { EnrolState.cancel(Prefs(this)); finish() },
-                    onReopen = { EnrolState.open() },
+                    onCancel = { EnrolState.cancel(prefs); finish() },
+                    onReopen = { EnrolState.open(prefs) },
                 )
             }
         }

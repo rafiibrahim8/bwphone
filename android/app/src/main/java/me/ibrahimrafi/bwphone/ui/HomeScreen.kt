@@ -27,6 +27,7 @@ import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.TimerOff
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material.icons.rounded.WifiOff
@@ -93,7 +94,7 @@ interface HomeActions {
     fun enrol()
     fun fixBattery()
     fun fixNotifications()
-    fun notificationSettings()
+    fun settings()
     fun revoke(accountHex: String)
     fun revokeAll()
 }
@@ -140,13 +141,14 @@ fun HomeScreen(
                     )
                     Box {
                         IconButton(onClick = { menu = true }) {
-                            Icon(Icons.Rounded.MoreVert, contentDescription = stringResource(R.string.more_options))
+                            // Tinted by hand: Home has no Surface, so the default content colour is black.
+                            Icon(Icons.Rounded.MoreVert, contentDescription = stringResource(R.string.more_options), tint = cs.onSurfaceVariant)
                         }
                         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                             DropdownMenuItem(
-                                text = { Text(stringResource(R.string.notification_settings)) },
-                                leadingIcon = { Icon(Icons.Rounded.Notifications, contentDescription = null) },
-                                onClick = { menu = false; actions.notificationSettings() },
+                                text = { Text(stringResource(R.string.settings)) },
+                                leadingIcon = { Icon(Icons.Rounded.Settings, contentDescription = null) },
+                                onClick = { menu = false; actions.settings() },
                             )
                         }
                     }
