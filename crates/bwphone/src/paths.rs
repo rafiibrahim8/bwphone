@@ -3,9 +3,11 @@
 //! - config `~/.config/bwphone/`: `config.toml` (the daemon's settings)
 //! - data `~/.local/share/bwphone/`: `pairing.json`, `accounts/<id>/`
 //! - state `~/.local/state/bwphone/`: `log`
-//! - runtime `$XDG_RUNTIME_DIR/bwphone/`: `sock` (proxies), `ctl` (CLI)
-//! - `$XDG_RUNTIME_DIR/bwphone-hello/hello.sock`: the one path the hello
-//!   process's sandbox can reach; everything under `bwphone/` is hidden from it
+//! - runtime `$XDG_RUNTIME_DIR/bwphone/`: `sock` (proxies), `ctl` (CLI),
+//!   `daemon.lock` (one daemon per user)
+//! - `$XDG_RUNTIME_DIR/bwphone-hello/`: `hello.sock`, and `hello.lock` (one
+//!   `bwphone-hello` per user); the one directory the hello process's sandbox
+//!   can reach, everything under `bwphone/` is hidden from it
 
 use std::{
     io,
@@ -69,6 +71,11 @@ impl Paths {
     /// The CLI connects here: one JSON line each way.
     pub fn control_socket(&self) -> PathBuf {
         self.runtime.join("ctl")
+    }
+
+    /// Held by the running daemon; a second one refuses to start.
+    pub fn daemon_lock(&self) -> PathBuf {
+        self.runtime.join("daemon.lock")
     }
 
     /// `bwphone-hello` connects here: plain text lines, key and hellos only.

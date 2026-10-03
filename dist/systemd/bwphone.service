@@ -15,6 +15,9 @@ ExecStartPre=+mkdir -p %h/.local/share/bwphone %h/.local/state/bwphone
 ExecStart=%h/.local/bin/bwphone daemon
 Restart=on-failure
 RestartSec=2
+# 3: another daemon already holds this user's lock (one started by hand,
+# say). Retrying every 2 s would not help; give up until it is stopped.
+RestartPreventExitStatus=3
 
 # systemd-coredump would write a crash dump holding the key to disk.
 LimitCORE=0
