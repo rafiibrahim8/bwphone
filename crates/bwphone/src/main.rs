@@ -33,16 +33,17 @@ use tokio::{
     long_about = "The bwphone daemon and command line. The daemon serves the Bitwarden browser \
 extensions over native messaging and releases the vault key only after an emoji pick and a \
 fingerprint on the paired phone. The other subcommands pair the phone, enrol accounts, \
-write the browsers' manifests and query the running daemon."
+write the browsers' manifests and query the running daemon.",
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon (the default).
+    /// Run the daemon.
     Daemon {
         /// Log to stderr instead of the state directory.
         #[arg(long)]
@@ -203,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Daemon { foreground: false }) {
+    match cli.command {
         Command::Daemon { foreground } => daemon(foreground).await,
         Command::Status => control(ControlRequest::Status).await,
         Command::Unlock { label, dry_run: _ } => control(ControlRequest::Unlock { label }).await,
