@@ -30,6 +30,7 @@ import androidx.compose.material3.toPath
 import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -90,23 +91,28 @@ fun SegmentRow(
     leading: (@Composable () -> Unit)? = null,
     trailing: (@Composable RowScope.() -> Unit)? = null,
 ) {
-    Row(
-        modifier
-            .fillMaxWidth()
-            .clip(segmentShape(index, count))
-            .background(container)
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-            .heightIn(min = 56.dp)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        leading?.invoke()
-        Column(Modifier.weight(1f)) {
-            Text(headline, style = MaterialTheme.typography.bodyLarge, color = headlineColor)
-            if (supporting != null) Text(supporting, style = MaterialTheme.typography.bodyMedium, color = supportingColor)
+    // A row that stays put while the group around it changes (Show all turns
+    // the last row into a middle one) kept its old clip: the layer's outline
+    // did not follow the new shape. A fresh row per corner arrangement does.
+    key(index == 0, index == count - 1) {
+        Row(
+            modifier
+                .fillMaxWidth()
+                .clip(segmentShape(index, count))
+                .background(container)
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+                .heightIn(min = 56.dp)
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            leading?.invoke()
+            Column(Modifier.weight(1f)) {
+                Text(headline, style = MaterialTheme.typography.bodyLarge, color = headlineColor)
+                if (supporting != null) Text(supporting, style = MaterialTheme.typography.bodyMedium, color = supportingColor)
+            }
+            trailing?.invoke(this)
         }
-        trailing?.invoke(this)
     }
 }
 
