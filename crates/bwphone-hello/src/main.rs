@@ -16,6 +16,9 @@
 //!
 //! IPv4 only for now: the phone queries over Wi-Fi IPv4. `ff02::fb` is a
 //! second socket and an AAAA record when it is needed.
+//!
+//! One per user: `hello.lock` beside the socket, under `flock`, held for the
+//! life of the process. A second one exits with [`ALREADY_RUNNING`].
 
 mod dns;
 
@@ -36,6 +39,9 @@ const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_PORT: u16 = 5353;
 const RECORD_TTL: u32 = 10;
 const RETRY: Duration = Duration::from_secs(5);
+/// Exit status when another `bwphone-hello` holds the lock; the unit lists it
+/// in `RestartPreventExitStatus=`, so systemd does not retry.
+const ALREADY_RUNNING: i32 = 3;
 
 fn log(msg: impl std::fmt::Display) {
     eprintln!("bwphone-hello: {msg}");
@@ -45,11 +51,41 @@ fn socket_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("bwphone-hello").join("hello.sock"))
 }
 
+/// An exclusive `flock` on `path`, or `None` if another process holds it.
+/// The kernel drops it however we exit. `flock` locks the file, not the path,
+/// so this unit's bind-mounted view and an unsandboxed copy share one lock.
+fn lock_single_instance(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    // The daemon's unit normally creates the directory; this is for a copy
+    // started by hand before the daemon ever ran.
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).mode(0o600).open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let Some(sock) = socket_path() else {
         log("XDG_RUNTIME_DIR is not set");
         std::process::exit(1);
+    };
+    let lock_path = sock.with_file_name("hello.lock");
+    let _lock = match lock_single_instance(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            log(format!("already running for this user ({} is locked)", lock_path.display()));
+            std::process::exit(ALREADY_RUNNING);
+        }
+        Err(e) => {
+            log(format!("cannot take {}: {e}", lock_path.display()));
+            std::process::exit(1);
+        }
     };
     // The key comes from the daemon, which reads the wallet; wait for both.
     let (key, port) = loop {
@@ -187,6 +223,18 @@ mod tests {
         assert!(ours.contains(&mdns::name_now(&key, now - 86_400)));
         assert!(!ours.contains(&mdns::name_now(&key, now + 2 * 86_400)));
         assert!(!ours.contains(&mdns::name_now(&[4u8; 32], now)));
+    }
+
+    #[test]
+    fn second_instance_is_refused_until_the_first_is_gone() {
+        let dir = std::env::temp_dir().join(format!("bwphone-hello-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("hello.lock");
+        let first = lock_single_instance(&path).unwrap().expect("nobody holds it yet");
+        assert!(lock_single_instance(&path).unwrap().is_none());
+        drop(first);
+        assert!(lock_single_instance(&path).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -64,6 +64,8 @@ flowchart LR
 | `$XDG_RUNTIME_DIR/bwphone/sock` | dir 0700, socket 0600 | `bwphone-proxy` | Native-messaging frames, relayed raw |
 | `$XDG_RUNTIME_DIR/bwphone/ctl` | dir 0700, socket 0600 | the CLI | One JSON line each way |
 | `$XDG_RUNTIME_DIR/bwphone-hello/hello.sock` | dir 0700, socket 0600 | `bwphone-hello` | ASCII lines: `key` → `key <64 hex> <port>` / `locked` / `missing`; `hello <ip> <port> <seq>` → `ok` / `stale` / `unpaired` / `error …` |
+| `$XDG_RUNTIME_DIR/bwphone/daemon.lock` | file 0600 | — | Held under `flock` by the running daemon (see [one of each per user](#one-of-each-per-user)) |
+| `$XDG_RUNTIME_DIR/bwphone-hello/hello.lock` | file 0600 | — | Held under `flock` by the running `bwphone-hello` |
 | `~/.config/bwphone/config.toml` | — | — | The daemon's settings, read at start (see [the PC indicator](#the-PC-indicator)) |
 | `~/.local/share/bwphone/` | see [storage](#12-storage-at-rest) | — | `pairing.json`, `accounts/<account_id>/` |
 | `~/.local/state/bwphone/log` | — | — | The daemon's log |
@@ -91,6 +93,33 @@ none.
   only its own runtime directory bound back, `CapabilityBoundingSet=` empty,
   `SystemCallFilter=@system-service`, `PrivateDevices`, `ProtectProc=invisible`.
   Compromised, it can tell the daemon a wrong phone address and nothing more.
+
+### One of each per user
+
+At most one daemon and one `bwphone-hello` run per user. Each takes an
+exclusive, non-blocking `flock` on its lock file before anything else: the
+daemon before it binds a socket, reads the wallet or sends a notification;
+`bwphone-hello` before it asks for `hello_key`. A second copy that finds the
+lock held prints why on stderr and exits with status 3, and both units set
+`RestartPreventExitStatus=3`, so systemd does not retry it every 2 s. The
+running copy is not touched.
+
+Without the lock, a second daemon would unlink the first's sockets and bind
+its own, leaving the first running, unreachable, with the key in memory, and
+both writing `pairing.json`. The lock is also what makes that unlink safe: a
+socket file the lock holder finds can only be left over from a dead daemon.
+
+- **No stale locks.** The kernel drops a `flock` when its holder exits,
+  `SIGKILL` and `panic = "abort"` included, so there is no PID file to clean
+  up.
+- **Through the sandboxes.** `flock` locks the file, not the path. The units'
+  views of `$XDG_RUNTIME_DIR` are bind mounts of the real directories, so a
+  copy inside a unit and one started by hand compete for the same lock.
+  `RuntimeDirectoryPreserve=yes` keeps the directories across restarts, so a
+  running `bwphone-hello` never holds a lock in a deleted copy.
+- **Per user, not per machine.** The lock files live in `$XDG_RUNTIME_DIR`.
+  The hello UDP port is still shared by every user on the machine; a second
+  user needs another `--hello-port` at pairing.
 
 ## 3. Native messaging interface
 

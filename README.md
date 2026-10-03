@@ -350,6 +350,7 @@ invalidated**: revoke them and enrol again.
 | An account is listed as `retired vault.blob 0x03` | It was enrolled with an older format that phones below Android 14 can't open. `bwphone account remove <name>`, revoke it on the phone, enrol again. |
 | `a browser manifest no longer points at bwphone-proxy` | The real Bitwarden desktop app (or an update) overwrote them. `bwphone manifests write`. |
 | Hellos refused as stale | `bwphone hello-reset`. |
+| `bwphone daemon` says a daemon is already running | Only one runs per user, and the systemd unit has it. To watch one in the terminal: `systemctl --user stop bwphone`, then `bwphone daemon --foreground`; `systemctl --user start bwphone` afterwards. `bwphone-hello` refuses a second copy the same way. |
 | Nothing works after the phone rebooted | Unlock the phone once: its keys are unavailable until the first unlock after a boot. |
 
 Logs: `~/.local/state/bwphone/log` on the PC; `adb logcat -s

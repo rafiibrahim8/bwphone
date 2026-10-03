@@ -43,7 +43,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon.
+    /// Run the daemon. Refuses to start if one is already running for this user.
     Daemon {
         /// Log to stderr instead of the state directory.
         #[arg(long)]
@@ -308,6 +308,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn daemon(foreground: bool) -> Result<(), Box<dyn std::error::Error>> {
     let paths = Paths::from_env()?;
+    // Before the sockets, the wallet or a notification: a second daemon would
+    // unlink the first's sockets and leave it running, unreachable, with the
+    // key in memory, both of them writing pairing.json.
+    let Some(_lock) = socket::lock_single_instance(&paths.daemon_lock())? else {
+        eprintln!(
+            "bwphone: a daemon is already running for this user ({} is locked). \
+To run one in the foreground, stop the unit first: systemctl --user stop bwphone",
+            paths.daemon_lock().display()
+        );
+        std::process::exit(socket::ALREADY_RUNNING);
+    };
     std::fs::create_dir_all(&paths.state)?;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     if foreground {

@@ -11,6 +11,9 @@ Type=simple
 ExecStart=%h/.local/lib/bwphone/bwphone-hello
 Restart=on-failure
 RestartSec=2
+# 3: another bwphone-hello already holds this user's lock (one started by hand,
+# say). Retrying every 2 s would not help; give up until it is stopped.
+RestartPreventExitStatus=3
 
 # This process listens to the network, so it gets the least of everything.
 # It holds only hello_key, which the daemon hands it over
