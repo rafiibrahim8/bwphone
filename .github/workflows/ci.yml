@@ -29,6 +29,11 @@ jobs:
   audit:
     name: RustSec advisories
     runs-on: ubuntu-latest
+    # audit-check reports findings as a check run; without this the job dies
+    # with "Resource not accessible by integration" instead of listing them.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Ignores live in .cargo/audit.toml, each with its reason.
