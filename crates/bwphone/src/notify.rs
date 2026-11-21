@@ -8,6 +8,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use tokio::sync::oneshot;
@@ -17,6 +18,12 @@ use tokio_stream::StreamExt as _;
 use zbus::zvariant::Value;
 
 const URGENCY_CRITICAL: u8 = 2;
+
+/// The most any notification or tray call may take. The unlock worker
+/// awaits them while the phone is already asking, and neither zbus nor
+/// dbus-broker times a method call out: a notification server that is
+/// frozen but still owns its name would otherwise stall every unlock.
+pub const DBUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 type Closer = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
@@ -33,16 +40,24 @@ impl Prompt {
     }
 
     /// Resolves when the person presses Use password; never, if there is no
-    /// notification to press it on.
+    /// notification to press it on. Dismissing the notification, another
+    /// action on it, or the server closing it is not a refusal: the request
+    /// carries on, answered on the phone.
     pub async fn use_password(&mut self) {
-        match &mut self.use_password {
-            Some(rx) => {
-                let _ = rx.await;
+        if let Some(rx) = &mut self.use_password {
+            let pressed = rx.await.is_ok();
+            // A completed receiver must not be polled again: callers re-arm this in a loop.
+            self.use_password = None;
+            if pressed {
+                return;
             }
-            None => std::future::pending().await,
         }
+        std::future::pending().await
     }
 
+    /// Takes the notification and the tray emoji down. Each D-Bus call in a
+    /// closer is bounded on its own, so the tray is cleared whatever the
+    /// notification server does.
     pub async fn close(mut self) {
         if let Some(close) = self.closer.take() {
             close().await;
@@ -60,6 +75,7 @@ pub enum Notifier {
 impl Notifier {
     pub async fn unlock_prompt(&self, label: &str, emoji: &str) -> Prompt {
         match self {
+            // Bounded inside, call by call, so the tray's closer always survives.
             Self::DBus(d) => d.prompt(label, emoji).await,
             Self::Fake(f) => f.prompt(label, emoji),
             Self::Silent => Prompt { use_password: None, closer: None },
@@ -69,11 +85,11 @@ impl Notifier {
     pub async fn warn(&self, summary: &str, body: &str) {
         tracing::warn!("{summary}: {body}");
         match self {
-            Self::DBus(d) => {
-                if let Err(e) = d.warn(summary, body).await {
-                    tracing::warn!("notification failed: {e}");
-                }
-            }
+            Self::DBus(d) => match tokio::time::timeout(DBUS_TIMEOUT, d.warn(summary, body)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("notification failed: {e}"),
+                Err(_) => tracing::warn!("notification timed out"),
+            },
             Self::Fake(f) => f.warnings.lock().unwrap().push((summary.into(), body.into())),
             Self::Silent => {}
         }
@@ -135,16 +151,28 @@ impl DBusNotifier {
     }
 
     /// The tray icon and/or the notification for one request. Closing the
-    /// prompt takes both down; a failed notification still leaves the tray.
+    /// prompt takes both down; a failed or late notification still leaves
+    /// the tray, and the tray is cleared whatever happens to the
+    /// notification. Returns at once: the notification is posted by its own
+    /// task, so the unlock never waits on the notification server.
     async fn prompt(&self, label: &str, emoji: &str) -> Prompt {
-        if let Some(t) = &self.tray {
-            t.show(label, emoji).await;
+        if let Some(t) = &self.tray
+            && tokio::time::timeout(DBUS_TIMEOUT, t.show(label, emoji)).await.is_err()
+        {
+            tracing::warn!("tray icon update timed out");
         }
         let mut prompt = if self.notify_prompts {
-            self.post(label, emoji).await.unwrap_or_else(|e| {
-                tracing::warn!("notification failed: {e}");
-                Prompt::none()
-            })
+            match tokio::time::timeout(DBUS_TIMEOUT, self.post(label, emoji)).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    tracing::warn!("notification failed: {e}");
+                    Prompt::none()
+                }
+                Err(_) => {
+                    tracing::warn!("notification timed out; answer on the phone");
+                    Prompt::none()
+                }
+            }
         } else {
             Prompt::none()
         };
@@ -155,41 +183,82 @@ impl DBusNotifier {
                     if let Some(close) = close_notification {
                         close().await;
                     }
-                    t.clear().await;
+                    if tokio::time::timeout(DBUS_TIMEOUT, t.clear()).await.is_err() {
+                        tracing::warn!("clearing the tray icon timed out");
+                    }
                 })
             }));
         }
         prompt
     }
 
+    /// Subscribes, then hands `Notify` to a task of its own, and returns.
+    ///
+    /// The task owns the notification for its whole life: if the prompt has
+    /// already ended when the server finally returns the id (a server that
+    /// was slow or frozen), it closes the notification itself; otherwise it
+    /// records the id for the closer and listens until the notification
+    /// goes away or the prompt ends. Only the Use password action sends.
     async fn post(&self, label: &str, emoji: &str) -> zbus::Result<Prompt> {
         // Subscribe before posting, so the action cannot slip past.
         let mut actions = self.proxy.receive_action_invoked().await?;
         let mut closed = self.proxy.receive_notification_closed().await?;
-        let hints = HashMap::from([("urgency", Value::U8(URGENCY_CRITICAL))]);
-        let id = self
-            .proxy
-            .notify(
-                "bwphone",
-                0,
-                "phone",
-                &format!("Unlock {label} · {emoji}"),
-                "Pick this emoji on your phone, then your fingerprint.",
-                &["password", "Use password"],
-                hints,
-                0,
-            )
-            .await?;
+        let shared = Arc::new(Mutex::new(Posted::default()));
+        let (ended_tx, mut ended_rx) = tokio::sync::watch::channel(false);
         let (tx, rx) = oneshot::channel();
+        let (proxy, task_shared) = (self.proxy.clone(), shared.clone());
+        let summary = format!("Unlock {label} · {emoji}");
         tokio::spawn(async move {
+            let hints = HashMap::from([("urgency", Value::U8(URGENCY_CRITICAL))]);
+            let body = "Pick this emoji on your phone, then your fingerprint.";
+            // Not bounded: a frozen server answers when it thaws, and the
+            // notification it then shows must still be taken down.
+            let notify = proxy.notify("bwphone", 0, "phone", &summary, body, &["password", "Use password"], hints, 0);
+            tokio::pin!(notify);
+            // Both subscriptions see every notification's signals, and zbus
+            // stops reading the socket once a match rule's queue (64) is full:
+            // left unread while Notify is pending, a burst of other
+            // notifications' signals would hold our reply behind them for
+            // good. So read and discard them meanwhile. None can be ours: the
+            // server's reply reaches us before any signal about its id.
+            let id = loop {
+                tokio::select! {
+                    biased;
+                    reply = &mut notify => match reply {
+                        Ok(id) => break id,
+                        Err(e) => {
+                            tracing::warn!("notification failed: {e}");
+                            return;
+                        }
+                    },
+                    Some(_) = actions.next() => {}
+                    Some(_) = closed.next() => {}
+                }
+            };
+            // One decision, under the lock: either the closer will find the id
+            // and close it, or the prompt already ended and this task does.
+            let already_ended = {
+                let mut posted = task_shared.lock().unwrap();
+                if !posted.ended {
+                    posted.id = Some(id);
+                }
+                posted.ended
+            };
+            if already_ended {
+                close_bounded(&proxy, id).await;
+                return;
+            }
             loop {
                 tokio::select! {
+                    // Actions first: a server sends ActionInvoked before the
+                    // NotificationClosed that follows a press, and both are
+                    // usually queued by the time this wakes. Taking the close
+                    // first would lose the press.
+                    biased;
                     Some(sig) = actions.next() => {
                         let Ok(a) = sig.args() else { continue };
-                        if *a.id() == id {
-                            if *a.action_key() == "password" {
-                                let _ = tx.send(());
-                            }
+                        if *a.id() == id && *a.action_key() == "password" {
+                            let _ = tx.send(());
                             break;
                         }
                     }
@@ -198,6 +267,8 @@ impl DBusNotifier {
                             break;
                         }
                     }
+                    // The prompt ended (or was dropped): stop listening.
+                    _ = ended_rx.changed() => break,
                     else => break,
                 }
             }
@@ -205,7 +276,16 @@ impl DBusNotifier {
         let proxy = self.proxy.clone();
         let closer: Closer = Box::new(move || {
             Box::pin(async move {
-                let _ = proxy.close_notification(id).await;
+                let id = {
+                    let mut posted = shared.lock().unwrap();
+                    posted.ended = true;
+                    posted.id.take()
+                };
+                let _ = ended_tx.send(true);
+                // No id yet: the posting task closes it when one comes.
+                if let Some(id) = id {
+                    close_bounded(&proxy, id).await;
+                }
             })
         });
         Ok(Prompt { use_password: Some(rx), closer: Some(closer) })
@@ -218,7 +298,24 @@ impl DBusNotifier {
     }
 }
 
-/// Records what would have been shown; tests press Use password on it.
+/// What the closer and the posting task share: whether the prompt has
+/// ended, and the notification's id once the server has given it.
+#[derive(Default)]
+struct Posted {
+    ended: bool,
+    id: Option<u32>,
+}
+
+async fn close_bounded(proxy: &NotificationsProxy<'static>, id: u32) {
+    match tokio::time::timeout(DBUS_TIMEOUT, proxy.close_notification(id)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("closing the unlock notification failed: {e}"),
+        Err(_) => tracing::warn!("closing the unlock notification timed out"),
+    }
+}
+
+/// Records what would have been shown; tests press Use password on it, or
+/// dismiss it.
 #[derive(Default)]
 pub struct FakeNotifier {
     pub prompts: Mutex<Vec<FakePrompt>>,
@@ -253,6 +350,11 @@ impl FakeNotifier {
         if let Some(tx) = self.prompts.lock().unwrap()[index].use_password.take() {
             let _ = tx.send(());
         }
+    }
+
+    /// The person closes the notification without pressing anything.
+    pub fn dismiss(&self, index: usize) {
+        drop(self.prompts.lock().unwrap()[index].use_password.take());
     }
 
     pub fn shown(&self) -> Vec<(String, String, bool)> {

@@ -64,6 +64,11 @@ flowchart LR
 | `$XDG_RUNTIME_DIR/bwphone/sock` | dir 0700, socket 0600 | `bwphone-proxy` | Native-messaging frames, relayed raw |
 | `$XDG_RUNTIME_DIR/bwphone/ctl` | dir 0700, socket 0600 | the CLI | One JSON line each way |
 | `$XDG_RUNTIME_DIR/bwphone-hello/hello.sock` | dir 0700, socket 0600 | `bwphone-hello` | ASCII lines: `key` → `key <64 hex> <port>` / `locked` / `missing`; `hello <ip> <port> <seq>` → `ok` / `stale` / `unpaired` / `error …` |
+
+On both sockets a line is at most 4096 bytes and must arrive within 10 s
+of the connection or the previous line; otherwise the connection is
+closed. A compromised `bwphone-hello` cannot make the daemon buffer
+without bound or hold a connection open.
 | `$XDG_RUNTIME_DIR/bwphone/daemon.lock` | file 0600 | — | Held under `flock` by the running daemon (see [one of each per user](#one-of-each-per-user)) |
 | `$XDG_RUNTIME_DIR/bwphone-hello/hello.lock` | file 0600 | — | Held under `flock` by the running `bwphone-hello` |
 | `~/.config/bwphone/config.toml` | — | — | The daemon's settings, read at start (see [the PC indicator](#the-PC-indicator)) |
@@ -213,14 +218,78 @@ when the request arrived, so a 40 s wait on the phone never produces a reply
 the extension drops as stale. The extension abandons a request after 60 s.
 
 **The SDK IPC channel.** The extension also opens a second port to the
-same host, for Bitwarden's SDK IPC (`bitwarden-ipc`: a JSON envelope
-`{"type":"bitwarden-ipc-message", …}` around CBOR frames of an
-unauthenticated Noise NN channel). bwphone does not speak it: those frames
-fail to parse as native messaging, are logged and dropped, and the
-extension's discover request on that port times out. With the server-side
-`biometrics-sdk-ipc` flag on, the extension asks for status, unlock and
-verification over that channel only, so bwphone can no longer serve it (see
-[Known limits](#15-known-limits)).
+same host, for Bitwarden's SDK IPC. With the server-side
+`biometrics-sdk-ipc` flag on (it is, since November 2026), the extension
+asks for status, unlock and verification over that channel only. bwphone
+answers it as the desktop app's `DesktopRenderer` (`bwphone-ipc`, verified
+against `browser-v2026.11.0` and `sdk-internal` `0.2.0-main.1214`). The
+daemon tells the two protocols apart frame by frame: an SDK IPC frame has
+`"type": "bitwarden-ipc-message"`.
+
+- *Envelope.* Extension to host:
+  `{"type":"bitwarden-ipc-message","message":{"destination":"DesktopRenderer","payload":[bytes],"topic"}}`.
+  Host to extension: `{"type":"forwarded-bitwarden-ipc-message","message":{"destination":{"BrowserBackground":{"id":"Own"}},"payload","topic"},"originalSource":"DesktopRenderer"}`.
+  The extension accepts a handshake finish or a response only from the
+  endpoint it addressed.
+- *Frames.* CBOR (serde's externally tagged enum, as `ciborium` writes it):
+  `HandshakeStart {ciphersuite, noise_frame}`, `HandshakeFinish` (the bare
+  `noise_frame`), `TransportFrame {payload (byte string), nonce}`, and
+  `CryptoInvalidated`.
+- *Noise.* NN, the browser initiates and names the suite
+  (`Noise_NN_P256_AESGCM_SHA256` by default; the two 25519 suites are also
+  accepted). No prologue, empty handshake payloads. Not authenticated:
+  whoever answers the pipe is "the desktop app", as with `setupEncryption`;
+  `SO_PEERCRED` on the socket is the real gate. After the handshake the raw
+  split keys seal each payload with the suite's AEAD, empty associated data
+  and an explicit `u64` nonce from 1; a nonce not above the last one is a
+  replay and is dropped. A `HandshakeStart` replaces the session (the
+  browser re-handshakes every 300 s); traffic with no session is answered
+  `CryptoInvalidated`.
+- *RPC.* JSON inside the channel, on envelope topic `RpcRequestMessage`:
+  `{"request","request_id","request_type","response_topic"}`; the response
+  goes out on `response_topic` as `{"result":{"Ok":…}|{"Err":…},"request_id","request_type"}`.
+
+| `request_type` | Answer |
+|---|---|
+| `DiscoverRequest` | `{"version": "bwphone <version>"}` |
+| `GetBiometricsStatus` `{user_id}` | `"Available"`, `"HardwareUnavailable"`, or `"NotEnabled"` with no account, by the same rule as the legacy status; within 400 ms of the extension's 500 ms (below) |
+| `UnlockBiometrics` `{user_id}` | `{"user_key": <base64>}`, or `{"user_key": null}` at once for an unenrolled `user_id` and for every failure |
+| `AuthenticateBiometrics` | `false`, for the reason given above |
+| anything else | `{"Err": "NoHandlerFound"}` |
+
+The status budget is the extension's: it waits 500 ms, a handshake
+included, and shows "desktop disconnected" past it. The check runs on its
+own task; after 400 ms the answer is `HardwareUnavailable`, and the check
+(a cold wallet read, a recovery ping) finishes in the background for the
+next query. One recovery ping runs at a time, on either protocol; other
+status queries wait for its result. A ping records its result only if
+no hello or reach happened while it ran, so a ping to an address the
+phone has left cannot mark it down. `user_id` matches case-insensitively,
+live and retired accounts alike, since the SDK re-serialises the GUID.
+
+Only RPC requests are decrypted. Everything else on the channel,
+including Shared Unlock's syncs (which carry the user key while the vault
+is unlocked) and fragments, is dropped unanswered without being opened.
+A request of a known type whose body does not parse is answered
+`{"Err": {"RequestDeserialization": …}}`, as the SDK does; ids and topics
+over 128 bytes are dropped. A `HandshakeStart` that fails leaves the
+working session in place.
+
+An answer with no session to seal it under (the extension invalidated
+the session while the phone was asking) is dropped. The extension sends
+`CryptoInvalidated` only when it has no session for us: after losing its
+state, which loses the pending request too, or after its own
+re-handshake timed out (2 s), which the daemon answers at once.
+
+The handshake uses snow; snow's P-256 key generation panics on the one
+in about 2^32 random draws that is not a valid scalar, so the daemon
+gives it an RNG that redraws those. The transport AEADs (`aes-gcm`,
+`chacha20poly1305`) wipe the AES round keys and the ChaCha key on drop.
+The AES-GCM GHASH subkey is not wiped: a temporary limitation, see §15.
+Wiping is hygiene, not a boundary: snow does not wipe its handshake
+state, whose ephemeral key with the public handshake bytes re-derives
+both transport keys, and anything that can read the daemon's memory can
+take the user key in any case (§14).
 
 **Concurrency.** Requests on one pipe are handled concurrently (the extension
 keeps polling status while an unlock waits on the phone); replies go out
@@ -304,7 +373,8 @@ answer (two browsers on one account need one fingerprint), if their own
 deadline still allows. A request whose browser has closed its pipe is
 dropped: skipped if it is still queued, and if its prompt is up, the
 session is closed (which takes the prompt down on the phone) unless another
-request for the same account is queued behind it.
+request for the same account is queued behind it, and then as soon as those
+have gone too.
 
 ## 5. Pairing
 
@@ -447,7 +517,9 @@ Early exits, each answered `false` at once:
   left in the queue.
 - During the human phase: the person picks a wrong emoji, taps None of these,
   dismisses or fails the fingerprint, leaves the pick screen, or presses Use
-  password on the PC's notification; the deadline passes (the phone
+  password on the PC's notification (closing the notification without
+  pressing it ends nothing: the request carries on, answered on the
+  phone); the deadline passes (the phone
   cancels the prompt and never sends `K_wrap`; a late one is discarded and
   zeroised on the PC).
 - After: the blob fails to open under the returned `K_wrap` (the PC warns
@@ -490,6 +562,23 @@ than failing. Warnings (someone else asked the phone, a manifest was
 overwritten, a retired account) are always notifications, whatever the
 settings. With `notification = false` there is no Use password action on the
 PC; the extension's own password field still works.
+
+The unlock never waits on the notification server. Neither zbus nor
+dbus-broker times a D-Bus call out, so a server that is frozen but still
+owns its name would otherwise stall every unlock. The notification is
+posted by a task of its own; if the request has ended by the time the
+server returns its id (a slow or frozen server), that task closes it.
+While it waits for the server's reply it keeps reading the action and
+close signals and discards them (none can be its own yet), so a burst of
+other notifications' signals cannot hold the reply up. Every other
+notification and tray call on the unlock path is bounded to 2 s, each on
+its own, so the tray is cleared when the request ends whatever the
+notification server does: a stale emoji left on screen would invite a pick for someone
+else's prompt. Use password is read before the close that follows it, so
+a press is never mistaken for a dismissal. A cold wallet read is bounded
+to 5 s. At start-up, registering the tray icon with the panel runs in the
+background and connecting to the session bus is bounded to 5 s, so a
+frozen panel or bus never keeps the daemon's sockets from coming up.
 
 ## 8. Enrollment
 
@@ -924,14 +1013,14 @@ here only on the fallback. Neither resists same-user malware.
   without StrongBox use the TEE.
 - **One fingerprint per account.** Three browsers on three accounts means
   three scans, by decision.
-- **Protocol drift.** Bitwarden's browser-to-desktop IPC is not a stable
-  interface; the implementation follows `browser-v2026.9.0` and fails loudly
-  on a shape it does not know.
-- **The `biometrics-sdk-ipc` flag.** When Bitwarden turns it on (from its
-  servers, with no extension update), the extension moves biometrics to the
-  SDK IPC channel, which bwphone does not speak. Nothing warns: the extension
-  reports the desktop app as disconnected, and every unlock falls back to the
-  master password.
+- **Protocol drift.** Neither of Bitwarden's browser-to-desktop protocols is
+  a stable interface. The legacy commands follow `browser-v2026.9.0`; SDK
+  IPC follows `browser-v2026.11.0` and `sdk-internal` `0.2.0-main.1214`,
+  which describes itself as not for public use. Bitwarden can move
+  biometrics between them from its servers (the `biometrics-sdk-ipc` flag)
+  with no extension update, and a change to either shows only as biometric
+  unlock no longer working. The desktop app's own code calls the legacy
+  biometrics channel "expected to be removed".
 - **The real desktop app overwrites the manifests**; the daemon warns at
   start, and `bwphone manifests write` puts them back.
 - **IPv4 only** for the hello and the mDNS answer.
@@ -939,3 +1028,45 @@ here only on the fallback. Neither resists same-user malware.
   which exists only from Android 16; on older phones only a `Cipher` can be
   bound to one fingerprint. An EC variant (faster in StrongBox) would be a
   new blob version.
+
+### Temporary limitations
+
+These are accepted for now only. They are **not part of this
+specification**: the specification is the behaviour without them, and
+each must be fixed in a later version. Each has a test that is ignored
+until then and must pass once fixed.
+
+- **GHASH subkey left in freed memory** (since the SDK IPC channel, §3).
+  - *What.* When an SDK IPC session ends (a re-handshake every 300 s,
+    `CryptoInvalidated`, the pipe closing), the AES-GCM GHASH subkey of
+    each direction, H = AES_K(0^128), stays in freed heap memory until
+    that memory is reused. The AES round keys are wiped; H is not. Only
+    the AES-GCM suites (the browser's default, P-256) are affected; the
+    ChaChaPoly suite is not.
+  - *Why.* `polyval` 0.6 (under `ghash`, under `aes-gcm` 0.10) picks its
+    backend at run time and keeps it in a union of `ManuallyDrop`s with
+    no `Drop` of its own, so the backend's own wipe never runs, whatever
+    features are enabled. Wiping the whole allocation from bwphone needs
+    `unsafe` code, which was declined.
+  - *What it costs.* In practice, nothing today:
+    - H does not decrypt anything, and the AES key cannot be derived
+      from it (AES is a pseudorandom permutation).
+    - H helps forge a message only under a nonce already used, which the
+      receiver refuses (nonces must strictly increase), and only for a
+      session that has already ended.
+    - Reading the freed memory takes root, the kernel, or a remanence
+      channel (unencrypted swap, a hibernation image, a cold boot): the
+      daemon is not dumpable, so a process of the same user cannot. Root
+      and the kernel can read the live user key anyway.
+    - The handshake state snow leaves in memory (§3) re-derives the full
+      transport keys, H included, from the same memory plus recorded
+      pipe traffic. While that stands, this adds no capability.
+
+    It is a defence-in-depth gap against memory remanence, not a way to
+    the user key.
+  - *Fix, in a later version.* Preferably upstream: a `Drop` for
+    `polyval`'s autodetect backend, or an `aes-gcm`/`polyval` release
+    that wipes it, then turn on its `zeroize` feature. Otherwise an
+    allocator-level wipe. When fixed, un-ignore
+    `crates/bwphone-ipc/tests/adv_round3_ghash_heap.rs::a_dropped_aes_gcm_session_key_leaves_no_key_material_in_freed_memory`
+    and delete this entry.

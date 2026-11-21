@@ -98,8 +98,12 @@ impl Accounts {
     }
 
     /// Neither a live nor a retired account holds this userId or label.
+    /// Exact match: this guards loading, and two directories whose userIds
+    /// differ only in case (none can be enrolled now, as enrolment checks
+    /// through the case-insensitive lookups) must not stop the daemon or
+    /// `account remove` from starting.
     fn check_free(&self, user_id: &str, label: &str) -> Result<(), AccountsError> {
-        if self.by_user_id(user_id).is_some() || self.retired.iter().any(|r| r.user_id == user_id) {
+        if self.live.iter().any(|a| a.user_id == user_id) || self.retired.iter().any(|r| r.user_id == user_id) {
             return Err(AccountsError::Duplicate(format!("userId {user_id}")));
         }
         if self.label_taken(label) {
@@ -108,8 +112,10 @@ impl Accounts {
         Ok(())
     }
 
+    /// userIds are GUIDs, so case does not matter: the extension's legacy
+    /// commands pass the server's string, SDK IPC a re-serialised `Uuid`.
     pub fn by_user_id(&self, user_id: &str) -> Option<&Account> {
-        self.live.iter().find(|a| a.user_id == user_id)
+        self.live.iter().find(|a| a.user_id.eq_ignore_ascii_case(user_id))
     }
 
     pub fn by_label(&self, label: &str) -> Option<&Account> {
@@ -154,8 +160,12 @@ pub fn id_hex(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 32 hex digits, nothing else. Anything else under `accounts/` is ignored.
 pub fn parse_id(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
+    // Byte offsets below: only ASCII hex may get that far (a 32-byte name with
+    // a multi-byte character would split it and panic; `from_str_radix` also
+    // takes a leading `+`).
+    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut id = [0u8; 16];
@@ -175,6 +185,18 @@ mod tests {
         assert_eq!(parse_id(&id_hex(&id)), Some(id));
         assert_eq!(parse_id("abc"), None);
         assert_eq!(parse_id(&"zz".repeat(16)), None);
+    }
+
+    #[test]
+    fn parse_id_takes_only_32_hex_digits() {
+        assert!(parse_id("00112233445566778899aabbccddeeff").is_some());
+        assert!(parse_id("00112233445566778899AABBCCDDEEFF").is_some());
+        assert!(parse_id("+0112233445566778899aabbccddeeff").is_none(), "from_str_radix would take the +");
+        // 32 bytes with a 3-byte character astride a pair boundary: must not panic.
+        let odd = format!("0{}{}", "€", "0".repeat(28));
+        assert_eq!(odd.len(), 32);
+        assert!(parse_id(&odd).is_none());
+        assert!(parse_id("0011").is_none());
     }
 
     #[test]

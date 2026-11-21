@@ -8,13 +8,14 @@ use std::{net::IpAddr, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
 
 use crate::{
     Ctx,
     accounts::id_hex,
     secrets::SecretsError,
     serve::availability,
+    socket::read_line_bounded,
     unlock::{self, Outcome},
 };
 
@@ -37,7 +38,7 @@ pub enum ControlRequest {
 pub async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(stream: S, ctx: Arc<Ctx>) -> std::io::Result<()> {
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
-    if stream.read_line(&mut line).await? == 0 {
+    if !read_line_bounded(&mut stream, &mut line).await? {
         return Ok(());
     }
     let reply = match serde_json::from_str::<ControlRequest>(&line) {

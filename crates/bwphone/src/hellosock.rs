@@ -14,21 +14,21 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
 use zeroize::Zeroizing;
 
 use crate::{
     Ctx,
     control::{self, ControlRequest},
     secrets::SecretsError,
+    socket::read_line_bounded,
 };
 
 pub async fn serve_hello_socket<S: AsyncRead + AsyncWrite + Unpin>(stream: S, ctx: Arc<Ctx>) -> std::io::Result<()> {
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
     loop {
-        line.clear();
-        if stream.read_line(&mut line).await? == 0 {
+        if !read_line_bounded(&mut stream, &mut line).await? {
             return Ok(());
         }
         // The `key` reply carries the hello key in hex; the buffer is wiped after the write.
@@ -77,6 +77,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt as _;
     use crate::{
         accounts::Accounts,
         notify::Notifier,

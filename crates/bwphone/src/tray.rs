@@ -219,11 +219,18 @@ impl Tray {
         let tray = Self { conn: conn.clone(), idle };
         let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
         let mut owners = dbus.receive_name_owner_changed_with_args(&[(0, WATCHER)]).await?;
-        register(&conn, &name).await;
+        // Registering is a call to the panel, which may be frozen or still
+        // starting at login: never on the daemon's start-up path, and never
+        // in the way of the next registration either.
+        tokio::spawn({
+            let (conn, name) = (conn.clone(), name.clone());
+            async move { register(&conn, &name).await }
+        });
         tokio::spawn(async move {
             while let Some(changed) = owners.next().await {
                 if changed.args().is_ok_and(|a| a.new_owner().is_some()) {
-                    register(&conn, &name).await;
+                    let (conn, name) = (conn.clone(), name.clone());
+                    tokio::spawn(async move { register(&conn, &name).await });
                 }
             }
         });

@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bwphone-ipc = { path = "../bwphone-ipc" }
 bwphone-nm = { path = "../bwphone-nm" }
 bwphone-transport = { path = "../bwphone-transport" }
 bwphone-wrap = { path = "../bwphone-wrap" }
@@ -30,5 +31,8 @@ png = "0.18.1"
 toml = "1.1.6"
 
 [dev-dependencies]
+# Paused clocks for timeout tests.
+tokio = { version = "1", features = ["full", "test-util"] }
+bwphone-ipc = { path = "../bwphone-ipc", features = ["browser"] }
 bwphone-fakephone = { path = "../bwphone-fakephone" }
 sha1 = "0.10"

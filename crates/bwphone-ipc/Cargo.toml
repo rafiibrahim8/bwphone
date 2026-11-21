@@ -1,0 +1,23 @@
+[package]
+name = "bwphone-ipc"
+description = "Bitwarden's SDK IPC biometrics protocol, as the desktop end: the JSON envelope, CBOR frames, the Noise NN responder and the RPC shapes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# The extension's side of the handshake, for tests that play the browser.
+browser = []
+
+[dependencies]
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+chacha20poly1305 = "0.10"
+ciborium = "0.2"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "default-resolver-crypto", "risky-raw-split", "use-p256"] }
+thiserror = "2"
+zeroize = "1"

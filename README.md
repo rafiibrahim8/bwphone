@@ -373,7 +373,8 @@ Tests: `cargo test --workspace` (the end-to-end ones run against
 |---|---|
 | `bwphone-transport` | Noise KK / NKpsk0, framing, messages, emoji, pairing words, hello, mDNS name — shared by both devices |
 | `bwphone-wrap` | `vault.blob` 0x04: an RSA-OAEP-wrapped `K_wrap` over an AES-GCM-sealed user key |
-| `bwphone-nm` | The extension's native-messaging protocol |
+| `bwphone-nm` | The extension's legacy native-messaging biometrics commands |
+| `bwphone-ipc` | Bitwarden's SDK IPC, which the extension uses for biometrics when the `biometrics-sdk-ipc` flag is on: envelope, CBOR frames, Noise NN responder, RPC |
 | `bwphone` | The daemon and CLI: sockets, wallet, notifications, the two-phase unlock, pairing, enrolment |
 | `bwphone-proxy` | Stdio ↔ socket relay the browsers spawn |
 | `bwphone-hello` | Receives the phone's encrypted address; answers its rotating mDNS name |

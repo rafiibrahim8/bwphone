@@ -144,7 +144,7 @@ pub async fn run(paths: &Paths, opts: EnrollOptions, ui: &mut dyn Ui) -> Result<
     if let Some(label) = existing
         .by_user_id(&user_id)
         .map(|a| a.label.clone())
-        .or_else(|| existing.retired().find(|r| r.user_id == user_id).map(|r| r.label.clone()))
+        .or_else(|| existing.retired().find(|r| r.user_id.eq_ignore_ascii_case(&user_id)).map(|r| r.label.clone()))
     {
         return Err(EnrollError::UserEnrolled(user_id, label));
     }

@@ -30,6 +30,9 @@ pub const HEADROOM: Duration = Duration::from_secs(10);
 pub const MIN_HUMAN: Duration = Duration::from_secs(15);
 /// After a failed reach, how long before a status query tries a ping.
 pub const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Once the first asker has gone, how often to check whether anyone else
+/// queued for the same account still waits.
+const WAITERS_POLL: Duration = Duration::from_millis(200);
 
 pub struct Job {
     pub account_id: [u8; 16],
@@ -86,6 +89,12 @@ pub struct PhoneState {
     pub last_reach_ok: Option<bool>,
     pub last_attempt: Option<Instant>,
     pub invalidated: HashSet<[u8; 16]>,
+    /// A status query's recovery ping is in flight: its result, when it
+    /// comes. Other queries wait for it instead of pinging again.
+    pub ping: Option<tokio::sync::watch::Receiver<Option<bool>>>,
+    /// Bumped by every hello and every reach. A ping records its result
+    /// only if nothing newer happened while it ran.
+    pub generation: u64,
 }
 
 impl PhoneState {
@@ -96,11 +105,17 @@ impl PhoneState {
     pub fn note_reach(&mut self, ok: bool) {
         self.last_reach_ok = Some(ok);
         self.last_attempt = Some(Instant::now());
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn note_hello(&mut self, addr: SocketAddr) {
         self.addr = Some(addr);
         self.last_reach_ok = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn pinging(&self) -> bool {
+        self.ping.is_some()
     }
 }
 
@@ -211,10 +226,11 @@ async fn run(ctx: &Ctx, job: &mut Job) -> Outcome {
             return refused(Reason::Invalidated);
         }
         match state.addr {
-            Some(a) => a,
+            Some(a) => (a, state.generation),
             None => return refused(Reason::NoAddress),
         }
     };
+    let (addr, generation) = addr;
     let Ok(key) = ctx.secrets.noise_static().await else { return refused(Reason::WalletLocked) };
 
     let reached = match ctx
@@ -259,7 +275,12 @@ async fn run(ctx: &Ctx, job: &mut Job) -> Outcome {
         }
         Err(e) => {
             tracing::info!("phone not reached: {e}");
-            ctx.state.lock().unwrap().note_reach(false);
+            // A hello (the phone woke, or moved) while this reach hung is the
+            // fresher word: only mark the phone down if nothing came in since.
+            let mut state = ctx.state.lock().unwrap();
+            if state.generation == generation {
+                state.note_reach(false);
+            }
             return refused(Reason::Unreachable);
         }
     };
@@ -269,7 +290,8 @@ async fn run(ctx: &Ctx, job: &mut Job) -> Outcome {
     tokio::pin!(answer);
     // If the browser that asked goes away, its prompt comes down (dropping the
     // session tells the phone), unless another request for this account is
-    // queued behind it and would take the same answer.
+    // queued behind it and would take the same answer — and then as soon as
+    // those have gone too.
     let mut asker_gone = false;
     let end = loop {
         tokio::select! {
@@ -280,6 +302,11 @@ async fn run(ctx: &Ctx, job: &mut Job) -> Outcome {
                     break End::Abandoned;
                 }
                 asker_gone = true;
+            }
+            _ = tokio::time::sleep(WAITERS_POLL), if asker_gone => {
+                if !ctx.queue.has_waiting(&account.id) {
+                    break End::Abandoned;
+                }
             }
         }
     };

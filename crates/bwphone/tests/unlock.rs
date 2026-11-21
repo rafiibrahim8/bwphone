@@ -432,3 +432,190 @@ async fn rate_limited_is_an_alarm() {
     // The next one goes through as usual.
     assert_eq!(browser.call("unlockWithBiometricsForUser", USER).await["response"], true);
 }
+
+// ---------------------------------------------------------------------------
+// SDK IPC: the same daemon, driven the way the extension drives it when the
+// server-side `biometrics-sdk-ipc` flag is on.
+
+mod sdk_ipc {
+    use super::*;
+    use bwphone_ipc::{
+        frame::{CipherSuite, Frame},
+        noise::initiator::Initiator,
+    };
+
+    /// The extension's `DesktopIpcTransport` plus its IPC client: its own
+    /// pipe, a Noise NN handshake to `DesktopRenderer`, then RPC.
+    struct IpcBrowser {
+        pipe: DuplexStream,
+        noise: Initiator,
+        next: u64,
+    }
+
+    fn envelope(frame: &Frame, topic: Option<&str>) -> Vec<u8> {
+        serde_json::to_vec(&json!({"type": "bitwarden-ipc-message", "message": {
+            "destination": "DesktopRenderer", "payload": frame.to_cbor(), "topic": topic
+        }}))
+        .unwrap()
+    }
+
+    impl IpcBrowser {
+        async fn connect(ctx: Arc<Ctx>) -> Self {
+            let (mut pipe, theirs) = tokio::io::duplex(1 << 16);
+            tokio::spawn(serve_proxy(theirs, ctx));
+            assert_eq!(read_frame(&mut pipe).await.unwrap().unwrap(), br#"{"command":"connected"}"#);
+            let (mut noise, start) = Initiator::start(CipherSuite::Noise_NN_P256_AESGCM_SHA256);
+            write_frame(&mut pipe, &envelope(&Frame::HandshakeStart(start), None)).await.unwrap();
+            let (frame, topic) = Self::read_envelope(&mut pipe).await;
+            assert_eq!(topic, None);
+            let Frame::HandshakeFinish(finish) = frame else { panic!("{frame:?}") };
+            noise.finish(&finish);
+            Self { pipe, noise, next: 0 }
+        }
+
+        /// Checks it comes from `DesktopRenderer`, as the extension requires.
+        async fn read_envelope(pipe: &mut DuplexStream) -> (Frame, Option<String>) {
+            let v: Value = serde_json::from_slice(&read_frame(pipe).await.unwrap().unwrap()).unwrap();
+            assert_eq!(v["type"], "forwarded-bitwarden-ipc-message");
+            assert_eq!(v["originalSource"], "DesktopRenderer");
+            let payload: Vec<u8> = serde_json::from_value(v["message"]["payload"].clone()).unwrap();
+            (Frame::from_cbor(&payload).unwrap(), v["message"]["topic"].as_str().map(Into::into))
+        }
+
+        async fn post(&mut self, topic: &str, body: &[u8]) {
+            let frame = Frame::TransportFrame(self.noise.seal(body));
+            write_frame(&mut self.pipe, &envelope(&frame, Some(topic))).await.unwrap();
+        }
+
+        async fn send(&mut self, request_type: &str, request: Value) -> String {
+            self.next += 1;
+            let id = format!("req-{}", self.next);
+            let body = json!({"request": request, "request_id": id, "request_type": request_type,
+                              "response_topic": format!("RpcResponseMessage:{id}")});
+            self.post("RpcRequestMessage", &serde_json::to_vec(&body).unwrap()).await;
+            id
+        }
+
+        /// The next response: (request_id, result).
+        async fn read(&mut self) -> (String, Value) {
+            let (frame, topic) = Self::read_envelope(&mut self.pipe).await;
+            let Frame::TransportFrame(t) = frame else { panic!("{frame:?}") };
+            let v: Value = serde_json::from_slice(&self.noise.open(&t)).unwrap();
+            let id = v["request_id"].as_str().unwrap().to_owned();
+            assert_eq!(topic.as_deref(), Some(format!("RpcResponseMessage:{id}").as_str()));
+            (id, v["result"].clone())
+        }
+
+        async fn call(&mut self, request_type: &str, request: Value) -> Value {
+            let id = self.send(request_type, request).await;
+            let (got, result) = self.read().await;
+            assert_eq!(got, id);
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_status_and_unlock_end_to_end() {
+        let w = world(always(Decision::Approve)).await;
+        let mut browser = IpcBrowser::connect(w.ctx.clone()).await;
+
+        let version = browser.call("DiscoverRequest", Value::Null).await;
+        assert!(version["Ok"]["version"].as_str().unwrap().starts_with("bwphone "));
+
+        // userIds are GUIDs; the SDK re-serialises them, so case must not matter.
+        let start = Instant::now();
+        assert_eq!(browser.call("GetBiometricsStatus", json!({"user_id": USER.to_uppercase()})).await, json!({"Ok": "Available"}));
+        assert!(start.elapsed() < Duration::from_millis(500));
+
+        let result = browser.call("UnlockBiometrics", json!({"user_id": USER})).await;
+        assert_eq!(result, json!({"Ok": {"user_key": b64(w.user_key.as_bytes())}}));
+        assert!(matches!(w.phone.events()[0], Event::Prompted(_)));
+
+        assert_eq!(browser.call("AuthenticateBiometrics", Value::Null).await, json!({"Ok": false}));
+        assert_eq!(browser.call("SomethingNew", json!({})).await, json!({"Err": "NoHandlerFound"}));
+    }
+
+    #[tokio::test]
+    async fn unenrolled_and_refused_unlocks_carry_no_key() {
+        let w = world(always(Decision::Deny)).await;
+        let mut browser = IpcBrowser::connect(w.ctx.clone()).await;
+        assert_eq!(browser.call("GetBiometricsStatus", json!({"user_id": "user-2"})).await, json!({"Ok": "NotEnabled"}));
+        let start = Instant::now();
+        assert_eq!(browser.call("UnlockBiometrics", json!({"user_id": "user-2"})).await, json!({"Ok": {"user_key": null}}));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(w.phone.events().is_empty(), "the phone must not be asked");
+
+        assert_eq!(browser.call("UnlockBiometrics", json!({"user_id": USER})).await, json!({"Ok": {"user_key": null}}));
+    }
+
+    /// The lock screen asks for status while an unlock waits on the phone,
+    /// and Shared Unlock syncs (which carry the user key) are dropped unanswered.
+    #[tokio::test]
+    async fn status_while_unlock_waits_and_syncs_are_dropped() {
+        let w = world(after(Duration::from_millis(800), Decision::Approve)).await;
+        let mut browser = IpcBrowser::connect(w.ctx.clone()).await;
+        let unlock = browser.send("UnlockBiometrics", json!({"user_id": USER})).await;
+        browser.post("SharedUnlockSync", br#"{"user_key":"c2VjcmV0"}"#).await;
+        let status = browser.send("GetBiometricsStatus", json!({"user_id": USER})).await;
+
+        let start = Instant::now();
+        let (first, result) = browser.read().await;
+        assert_eq!(first, status, "status must not queue behind the unlock, and the sync gets no answer");
+        assert_eq!(result, json!({"Ok": "Available"}));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        let (second, result) = browser.read().await;
+        assert_eq!(second, unlock);
+        assert_eq!(result["Ok"]["user_key"], b64(w.user_key.as_bytes()));
+    }
+
+    /// A phone believed down is re-checked with a ping that can take
+    /// seconds; the status answer must not wait for it.
+    #[tokio::test]
+    async fn status_is_answered_inside_the_budget_while_a_ping_runs() {
+        let w = world(always(Decision::Approve)).await;
+        // A listener that never accepts: the ping connects, then waits out its reach budget.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        {
+            let mut state = w.ctx.state.lock().unwrap();
+            state.addr = Some(silent.local_addr().unwrap());
+            state.note_reach(false);
+            state.last_attempt = Some(Instant::now() - unlock::RETRY_AFTER);
+        }
+        let mut browser = IpcBrowser::connect(w.ctx.clone()).await;
+        let start = Instant::now();
+        assert_eq!(browser.call("GetBiometricsStatus", json!({"user_id": USER})).await, json!({"Ok": "HardwareUnavailable"}));
+        assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+        assert!(w.ctx.state.lock().unwrap().pinging(), "the ping carries on in the background");
+
+        // A second query does not start a second ping.
+        assert_eq!(browser.call("GetBiometricsStatus", json!({"user_id": USER})).await, json!({"Ok": "HardwareUnavailable"}));
+        let ctx = w.ctx.clone();
+        wait_for("the ping to end", || !ctx.state.lock().unwrap().pinging()).await;
+        drop(silent);
+    }
+
+    /// Both protocols on one daemon: the legacy pipe still works beside an IPC one.
+    #[tokio::test]
+    async fn legacy_and_ipc_pipes_side_by_side() {
+        let w = world(always(Decision::Approve)).await;
+        let mut ipc = IpcBrowser::connect(w.ctx.clone()).await;
+        let mut legacy = Browser::connect(w.ctx.clone(), "app-1").await;
+        assert_eq!(legacy.call("getBiometricsStatusForUser", USER).await["response"], 0);
+        assert_eq!(ipc.call("GetBiometricsStatus", json!({"user_id": USER})).await, json!({"Ok": "Available"}));
+    }
+}
+
+/// Closing the notification is not Use password: the request carries on,
+/// and the key arrives when the phone approves.
+#[tokio::test]
+async fn dismissing_the_notification_does_not_cancel_the_unlock() {
+    let w = world(after(Duration::from_millis(400), Decision::Approve)).await;
+    let mut browser = Browser::connect(w.ctx.clone(), "app-1").await;
+    let unlock = tokio::spawn(async move { browser.call("unlockWithBiometricsForUser", USER).await });
+    let notifier = w.notifier.clone();
+    wait_for("the prompt", || notifier.shown().len() == 1).await;
+    w.notifier.dismiss(0);
+    let reply = unlock.await.unwrap();
+    assert_eq!(reply["response"], true);
+    assert_eq!(reply["userKeyB64"], b64(w.user_key.as_bytes()));
+}

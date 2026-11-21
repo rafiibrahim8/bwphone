@@ -356,10 +356,17 @@ To run one in the foreground, stop the unit first: systemctl --user stop bwphone
         tray_idle = ?config.indicator.tray_idle,
         "indicator"
     );
-    let notifier = match bwphone::notify::DBusNotifier::connect(&config.indicator).await {
-        Ok(n) => Notifier::DBus(n),
-        Err(e) => {
+    // Bounded: nothing here may keep the sockets from coming up. Past the
+    // bound, unlocks still work, answered on the phone.
+    let connect = bwphone::notify::DBusNotifier::connect(&config.indicator);
+    let notifier = match tokio::time::timeout(std::time::Duration::from_secs(5), connect).await {
+        Ok(Ok(n)) => Notifier::DBus(n),
+        Ok(Err(e)) => {
             tracing::warn!("no session bus for notifications: {e}");
+            Notifier::Silent
+        }
+        Err(_) => {
+            tracing::warn!("the session bus did not answer in time: no notifications or tray until restart");
             Notifier::Silent
         }
     };

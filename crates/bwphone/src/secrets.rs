@@ -56,6 +56,9 @@ impl std::fmt::Debug for Key32 {
 
 type Cache = Mutex<Option<Arc<Key32>>>;
 
+/// The most one cold read of a wallet item may take.
+const WALLET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub enum Secrets {
     /// The wallet, each item read once and cached.
     Wallet { noise: Cache, hello: Cache },
@@ -95,7 +98,13 @@ async fn cached(cache: &Cache, key: &'static str) -> Result<Arc<Key32>, SecretsE
     if let Some(k) = cache.lock().unwrap().clone() {
         return Ok(k);
     }
-    let k = Arc::new(read_item(key).await?);
+    // Bounded: a status check may run this on a task its pipe cannot abort,
+    // and a frozen wallet service would otherwise keep each one (and its
+    // bus connection) alive. Reading never prompts, so 5 s is plenty.
+    let k = match tokio::time::timeout(WALLET_TIMEOUT, read_item(key)).await {
+        Ok(read) => Arc::new(read?),
+        Err(_) => return Err(SecretsError::Bus("the wallet did not answer in time".into())),
+    };
     *cache.lock().unwrap() = Some(k.clone());
     Ok(k)
 }
